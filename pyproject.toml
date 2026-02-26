@@ -1,0 +1,35 @@
+[project]
+name = "balerion-alpha"
+version = "0.1.0"
+description = "Research and backtesting layer for the Balerion quant hedge fund"
+readme = "README.md"
+authors = [
+    { name = "Khizar Imran", email = "khzrimrn@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "vectorbt>=0.26.0",
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+    "pyarrow>=12.0.0",
+    "matplotlib>=3.7.0",
+    "seaborn>=0.12.0",
+    "jupyter>=1.0.0",
+    "ipython>=8.0.0",
+    "pyyaml>=6.0",
+    "plotly>=5.14.0",
+    "scipy>=1.10.0",
+    "scikit-learn>=1.3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.10.6,<0.11.0"]
+build-backend = "uv_build"
