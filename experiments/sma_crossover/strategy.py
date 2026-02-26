@@ -152,8 +152,8 @@ if __name__ == "__main__":
     df, fig = run_experiment(
         symbol="EURUSD",
         asset_type="fx",
-        start_date="2025-01-01",
-        end_date="2025-02-26",
+        start_date="2025-11-18",
+        end_date="2026-02-25",
         fast_period=20,
         slow_period=50,
         show_chart=True,
