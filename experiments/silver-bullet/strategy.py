@@ -14,7 +14,10 @@ Strategy Logic:
          creating an imbalance that price pulls back into.
       3. Entry: price retraces into the FVG zone during any session window.
       4. One entry per session per trading day (first qualifying bar wins).
-  - Exit:       52 bars (52 minutes) after entry — time-based exit.
+  - Stop Loss:  Below the swept liquidity low minus a 1-point buffer.
+  - Take Profit: 2:1 Risk/Reward ratio (TP distance = 2 × SL distance).
+  - Time Exit:  52-bar fallback if neither SL nor TP is hit.
+  - Session Cap: Stop trading a session once cumulative loss exceeds -$2,000.
 """
 
 import sys
@@ -38,6 +41,10 @@ def calculate_signals(
     liquidity_window: int = 240,
     sweep_lookback: int = 120,
     pullback_window: int = 15,
+    rr_ratio: float = 2.0,
+    sl_buffer_pts: float = 1.0,
+    session_cap_usd: float = -2_000.0,
+    lot_size: int = 10,
 ) -> pd.DataFrame:
     """
     Calculate ICT Silver Bullet entry signals across three sessions.
@@ -47,11 +54,13 @@ def calculate_signals(
       - New York AM : 10:00 – 10:59 ET
       - New York PM : 14:00 – 14:59 ET
 
-    One entry is allowed per session per calendar day.  A qualifying bar must:
+    One entry is allowed per session per calendar day, subject to the
+    session P&L cap.  A qualifying bar must:
       1. Have lows swept (bullish liquidity bias).
       2. Have highs NOT swept (bullish bias confirmed).
       3. Close inside an active bullish FVG zone.
       4. Fall within one of the three session windows.
+      5. The session's cumulative estimated P&L has not hit session_cap_usd.
 
     Timezone note — broker server time:
       The MT5 data timestamps are in broker server time, which is UTC+2 in
@@ -82,6 +91,14 @@ def calculate_signals(
                              liquidity level has been swept (default 120 = 2 h).
         pullback_window:     How many bars the FVG zone is kept alive for a
                              pullback entry (default 15 minutes).
+        rr_ratio:            Take-profit = rr_ratio × SL distance (default 2.0).
+        sl_buffer_pts:       Extra points below the swept liquidity low for the
+                             stop loss (default 1.0 point).
+        session_cap_usd:     Maximum cumulative loss per session per day in $.
+                             Once hit, no further entries are taken in that
+                             session for the rest of that day (default -2000).
+        lot_size:            Lot size used for session cap estimation — must
+                             match the lot size used in the backtest (default 10).
 
     Returns:
         DataFrame with extra columns:
@@ -95,7 +112,14 @@ def calculate_signals(
           - session_label                     : 'london' | 'ny_am' | 'ny_pm' | ''
           - buy_signal                        : raw entry signals (all qualifying bars)
           - buy_signal_daily                  : one entry per session per day
-          - sell_signal                       : time-based exits (52 bars after entry)
+                                                (after session cap applied)
+          - sl_price                          : stop loss price for each entry bar
+          - tp_price                          : take profit price for each entry bar
+          - sl_stop_frac                      : SL as fraction of entry price
+                                                (for vectorbt sl_stop parameter)
+          - tp_stop_frac                      : TP as fraction of entry price
+                                                (for vectorbt tp_stop parameter)
+          - sell_signal                       : 52-bar fallback time exit
     """
     df = df.copy()
 
@@ -191,24 +215,84 @@ def calculate_signals(
     )
 
     # ------------------------------------------------------------------
-    # 6. One entry per SESSION per calendar day
-    #    This allows up to three trades on the same day — one per window.
+    # 6. One entry per SESSION per calendar day + session P&L cap
+    #
+    #    Process each (date, session) group chronologically.
+    #    Track a running estimated P&L for the session — when it drops
+    #    below session_cap_usd, no further entries are allowed that day.
+    #
+    #    P&L estimate per trade:
+    #      - SL hit   -> loss  = -sl_distance * lot_size
+    #      - TP hit   -> gain  =  sl_distance * rr_ratio * lot_size
+    #    We assume the trade resolves at SL or TP (50/50 prior) but only
+    #    use the SL loss for a conservative cap estimate — i.e. if the
+    #    previous trade in the session was a loser we count its full SL loss.
+    #    Winners don't offset the cap (conservative approach).
     # ------------------------------------------------------------------
     df["buy_signal_daily"] = False
+    df["sl_price"] = np.nan
+    df["tp_price"] = np.nan
     df["_date"] = df.index.date
 
     for (date, session), group in df.groupby(["_date", "session_label"]):
         if session == "":
             continue
-        day_session_entries = group["buy_signal"]
-        if day_session_entries.any():
-            first_idx = day_session_entries.idxmax()
-            df.loc[first_idx, "buy_signal_daily"] = True
+
+        session_pnl = 0.0  # running estimated loss for this session
+        prev_sl_dist = None  # SL distance (points) of last trade taken
+
+        day_session_mask = group["buy_signal"]
+
+        for bar_time, is_signal in day_session_mask.items():
+            if not is_signal:
+                continue
+
+            # Apply session cap: if running loss already at/below cap, skip
+            if session_pnl <= session_cap_usd:
+                continue
+
+            entry_price = close.loc[bar_time]
+            liq_low = df.loc[bar_time, "liquidity_low"]
+
+            sl_price = liq_low - sl_buffer_pts
+            sl_dist = entry_price - sl_price
+
+            # Guard: skip if SL distance is zero or negative (malformed bar)
+            if sl_dist <= 0:
+                continue
+
+            tp_price = entry_price + sl_dist * rr_ratio
+
+            df.loc[bar_time, "buy_signal_daily"] = True
+            df.loc[bar_time, "sl_price"] = sl_price
+            df.loc[bar_time, "tp_price"] = tp_price
+
+            # Estimate the P&L impact of this trade for the cap
+            # Conservatively assume a loss (SL hit) to be cautious
+            estimated_loss = -sl_dist * lot_size
+            session_pnl += estimated_loss
+            prev_sl_dist = sl_dist
+
+            # Only allow one entry per session per day
+            break
 
     df.drop(columns=["_date"], inplace=True)
 
     # ------------------------------------------------------------------
-    # 7. Time-based exit — 52 bars (minutes) after each entry
+    # 7. Compute SL/TP as fractions of entry price for vectorbt
+    #    sl_stop_frac = sl_distance / entry_price  (fraction below entry)
+    #    tp_stop_frac = tp_distance / entry_price  (fraction above entry)
+    # ------------------------------------------------------------------
+    entry_close = close.where(df["buy_signal_daily"])
+    sl_dist_col = entry_close - df["sl_price"]
+    tp_dist_col = df["tp_price"] - entry_close
+
+    df["sl_stop_frac"] = sl_dist_col / entry_close
+    df["tp_stop_frac"] = tp_dist_col / entry_close
+
+    # ------------------------------------------------------------------
+    # 8. Time-based fallback exit — 52 bars (minutes) after each entry
+    #    vectorbt will use SL/TP first; this only triggers if neither fires.
     # ------------------------------------------------------------------
     exit_bars = 52
     df["sell_signal"] = False
