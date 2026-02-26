@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "skills": {
+    "vectorbt-expert": {
+      "source": "marketcalls/vectorbt-backtesting-skills",
+      "sourceType": "github",
+      "computedHash": "6d6787732acbf3ca8b3465019066f61fc51424ad63da0fbdafcd8216e33c466f"
+    }
+  }
+}
