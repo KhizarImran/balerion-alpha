@@ -1,6 +1,6 @@
 ---
 name: vectorbt-expert
-description: VectorBT backtesting expert. Use when user asks to backtest strategies, create entry/exit signals, analyze portfolio performance, optimize parameters, fetch historical data, use VectorBT/vectorbt, compare strategies, position sizing, equity curves, drawdown charts, or trade analysis. Also triggers for openalgo.ta helpers (exrem, crossover, crossunder, flip, donchian, supertrend).
+description: VectorBT backtesting expert. Use when user asks to backtest strategies, create entry/exit signals, analyze portfolio performance, optimize parameters, fetch historical data, use VectorBT/vectorbt, compare strategies, position sizing, equity curves, drawdown charts, or trade analysis. Also triggers for FX lot sizes, pip-based stop loss/take profit, spread costs, or FX strategy backtesting.
 user-invocable: false
 ---
 
@@ -9,967 +9,705 @@ user-invocable: false
 ## Environment
 
 - Python with vectorbt, pandas, numpy, plotly
-- Data source: OpenAlgo Python SDK (`openalgo` package) for Indian markets
-- Alternative data: `yfinance` for Yahoo Finance data
-- All scripts run from `D:\QuantFlow 3\Day17\backtesting\`
-- Environment variables loaded from `.env` file in the script directory
-- Never use icons/emojis in code or logger output
+- Data source: `utils.data_loader` (balerion-data Parquet files — sibling repo at `../balerion-data/`)
+- All scripts run via `uv run python` from the project root `balerion-alpha/`
+- Reports saved to `reports/` directory (gitignored — never commit)
+- Never use icons/emojis in code or output
 
-## Data Fetching
-
-### OpenAlgo (Primary - Indian Markets)
+## Project Path Bootstrap (Required in Every Script)
 
 ```python
-import os
-from datetime import datetime, timedelta
+import sys
 from pathlib import Path
-import pandas as pd
-from dotenv import load_dotenv
-from openalgo import api
-
-# Load environment
-script_dir = Path(__file__).resolve().parent
-load_dotenv(dotenv_path=script_dir / ".env", override=False)
-
-api_key = os.getenv("OPENALGO_API_KEY")
-host = os.getenv("OPENALGO_HOST", "http://127.0.0.1:5000")
-
-client = api(api_key=api_key, host=host)
-
-# Fetch historical data
-df = client.history(
-    symbol="SBIN",           # OpenAlgo symbol format
-    exchange="NSE",          # NSE, BSE, NFO, BFO, CDS, MCX
-    interval="5m",           # 1m, 3m, 5m, 10m, 15m, 30m, 1h, D
-    start_date="2025-01-01",
-    end_date="2025-02-25",
-)
-# Returns DataFrame with columns: close, high, low, open, volume
-# Index: timestamp (datetime with timezone)
-
-close = df["close"]
+project_root = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(project_root))
 ```
 
-### OpenAlgo Intervals
+---
 
-| Interval | Code |
-|----------|------|
-| 1 minute | `1m` |
-| 3 minutes | `3m` |
-| 5 minutes | `5m` |
-| 10 minutes | `10m` |
-| 15 minutes | `15m` |
-| 30 minutes | `30m` |
-| 1 hour | `1h` |
-| Daily | `D` |
+## Data Loading
 
-### OpenAlgo Exchange Codes
+### Data Source: balerion-data
 
-| Exchange | Code | Description |
-|----------|------|-------------|
-| NSE | `NSE` | National Stock Exchange equities |
-| BSE | `BSE` | Bombay Stock Exchange equities |
-| NFO | `NFO` | NSE Futures and Options |
-| BFO | `BFO` | BSE Futures and Options |
-| CDS | `CDS` | NSE Currency Derivatives |
-| BCD | `BCD` | BSE Currency Derivatives |
-| MCX | `MCX` | Multi Commodity Exchange |
-| NSE_INDEX | `NSE_INDEX` | NSE Indices |
-| BSE_INDEX | `BSE_INDEX` | BSE Indices |
+All market data lives in the sibling repository `../balerion-data/` as Parquet files collected via MetaTrader 5. The file naming convention is `{symbol_lower}_{timeframe}.parquet`.
 
-### OpenAlgo Symbol Format
+```
+../balerion-data/data/
+    fx/
+        audnzd_1m.parquet
+        eurgbp_1m.parquet
+        eurusd_1m.parquet
+        gbpusd_1m.parquet
+        usdcad_1m.parquet
+        usdjpy_1m.parquet
+    indices/
+        us30_1m.parquet
+        xauusd_1m.parquet
+```
 
-- **Equity**: `SBIN`, `RELIANCE`, `INFY`, `HDFCBANK`
-- **Futures**: `BANKNIFTY24APR24FUT` (BaseSymbol + ExpiryDate + FUT)
-- **Options**: `NIFTY28MAR2420800CE` (BaseSymbol + ExpiryDate + StrikePrice + CE/PE)
-- **Index**: `NIFTY`, `BANKNIFTY`, `FINNIFTY` (with exchange=NSE_INDEX)
+All files are **1-minute native OHLCV** data. Resample to higher timeframes as needed.
 
-### Yahoo Finance (Alternative)
+### Available FX Pairs & Instruments
+
+| Asset Class | Symbols | Parquet File | Native Timeframe |
+|-------------|---------|-------------|-----------------|
+| FX Pairs | EURUSD | `fx/eurusd_1m.parquet` | 1 minute |
+| FX Pairs | USDJPY | `fx/usdjpy_1m.parquet` | 1 minute |
+| FX Pairs | GBPUSD | `fx/gbpusd_1m.parquet` | 1 minute |
+| FX Pairs | EURGBP | `fx/eurgbp_1m.parquet` | 1 minute |
+| FX Pairs | USDCAD | `fx/usdcad_1m.parquet` | 1 minute |
+| FX Pairs | AUDNZD | `fx/audnzd_1m.parquet` | 1 minute |
+| Indices | US30 | `indices/us30_1m.parquet` | 1 minute |
+| Indices | XAUUSD | `indices/xauusd_1m.parquet` | 1 minute |
+
+OHLCV columns are lowercase: `open`, `high`, `low`, `close`, `volume`.
+The DataFrame index is a `DatetimeIndex` named `timestamp`.
+
+### Loading Data
 
 ```python
-import yfinance as yf
-import vectorbt as vbt
+from utils import load_data, DataLoader
 
-# Method 1: via yfinance directly
-df = yf.download("RELIANCE.NS", start="2015-01-01", end="2026-02-24",
-                  interval="1d", auto_adjust=True, multi_level_index=False)
-close = df['Close']
+# --- Quick one-liner (most common) ---
+df = load_data('EURUSD', asset_type='fx', start_date='2024-01-01')
+df = load_data('EURUSD', asset_type='fx', start_date='2024-01-01', end_date='2024-12-31')
+df = load_data('XAUUSD', asset_type='indices', start_date='2024-01-01')
 
-# Method 2: via VectorBT wrapper
-data = vbt.YFData.download("RELIANCE.NS", start="2015-01-01", end="2026-02-24")
-close = data.get("Close")
+# --- Full DataLoader class ---
+loader = DataLoader()
+
+# Load FX pair
+df = loader.load_fx('EURUSD', start_date='2024-01-01', end_date='2025-01-01')
+
+# Load index / commodity
+df = loader.load_index('US30', start_date='2024-01-01')
+df = loader.load_index('XAUUSD', start_date='2024-01-01')
+
+# Load multiple symbols at once → returns dict {symbol: DataFrame}
+data = loader.load_multiple(
+    ['EURUSD', 'GBPUSD', 'USDJPY'],
+    asset_type='fx',
+    start_date='2024-01-01',
+)
+# Access: data['EURUSD'], data['GBPUSD'], etc.
+
+# Discover available symbols
+print(loader.get_available_fx_symbols())     # ['AUDNZD', 'EURGBP', 'EURUSD', ...]
+print(loader.get_available_index_symbols())  # ['US30', 'XAUUSD']
+
+# Inspect data coverage for a symbol
+info = loader.get_data_info('EURUSD', asset_type='fx')
+print(info)
+# {'symbol': 'EURUSD', 'rows': ..., 'start_date': ..., 'end_date': ...,
+#  'file_size_mb': ..., 'columns': ['open', 'high', 'low', 'close', 'volume']}
 ```
+
+### Resampling to Higher Timeframes
+
+All data is 1-minute native. Always resample before backtesting to avoid excessive bar counts:
+
+```python
+loader = DataLoader()
+df_1m = loader.load_fx('EURUSD', start_date='2024-01-01')
+
+df_5m  = loader.resample_ohlcv(df_1m, '5T')    #  5-minute bars
+df_15m = loader.resample_ohlcv(df_1m, '15T')   # 15-minute bars
+df_1h  = loader.resample_ohlcv(df_1m, '1H')    #  1-hour bars
+df_4h  = loader.resample_ohlcv(df_1m, '4H')    #  4-hour bars
+df_1d  = loader.resample_ohlcv(df_1m, '1D')    #  daily bars
+
+close = df_1h['close']
+high  = df_1h['high']
+low   = df_1h['low']
+```
+
+The `resample_ohlcv` aggregation rules:
+- `open` → first bar of period
+- `high` → max of period
+- `low` → min of period
+- `close` → last bar of period
+- `volume` → sum of period
+- `spread` → mean of period (if present)
+- `real_volume` → sum of period (if present)
+- Incomplete (NaN) periods are dropped automatically.
+
+### Freq Strings for vectorbt
+
+| Timeframe | `freq=` string |
+|-----------|---------------|
+| 1 minute  | `'1T'`        |
+| 5 minutes | `'5T'`        |
+| 15 minutes| `'15T'`       |
+| 1 hour    | `'1H'`        |
+| 4 hours   | `'4H'`        |
+| Daily     | `'1D'`        |
+
+---
+
+## FX Fundamentals for Backtesting
+
+### Pip Values
+
+A **pip** is the smallest standard price move for an FX pair.
+
+| Pair      | Pip Size | Example: 50 pip SL |
+|-----------|----------|--------------------|
+| EURUSD    | 0.0001   | sl_stop = 50 * 0.0001 = 0.005 |
+| GBPUSD    | 0.0001   | sl_stop = 0.005 |
+| USDCAD    | 0.0001   | sl_stop = 0.005 |
+| EURGBP    | 0.0001   | sl_stop = 0.005 |
+| AUDNZD    | 0.0001   | sl_stop = 0.005 |
+| USDJPY    | 0.01     | sl_stop = 50 * 0.01 = 0.5 |
+| XAUUSD    | 0.01     | sl_stop = 50 * 0.01 = 0.5 |
+
+**IMPORTANT**: vectorbt `sl_stop` and `tp_stop` are expressed as a **decimal fraction of price** (not pips directly). Convert pips to a fraction:
+
+```python
+# For a 4-decimal pair (EURUSD, GBPUSD, etc.)
+PIP = 0.0001
+SL_PIPS = 30
+TP_PIPS = 60
+entry_price = close.mean()  # approximate entry
+
+sl_stop = (SL_PIPS * PIP) / entry_price   # e.g. 30 pips on 1.0800 = 0.00278
+tp_stop = (TP_PIPS * PIP) / entry_price
+
+# For a 2-decimal pair (USDJPY)
+PIP_JPY = 0.01
+SL_PIPS = 30
+sl_stop = (SL_PIPS * PIP_JPY) / entry_price
+```
+
+### Lot Sizes
+
+| Lot Type    | Units (base currency) | Typical Use |
+|-------------|----------------------|-------------|
+| Standard    | 100,000              | Professional / institutional |
+| Mini        | 10,000               | Retail traders |
+| Micro       | 1,000                | Small accounts / testing |
+| Nano        | 100                  | Minimum position |
+
+In vectorbt, "units" = the number of **base currency units** (contracts):
+
+```python
+# size_type="amount" with lot sizes
+LOT = 100_000    # 1 standard lot
+MINI_LOT = 10_000
+MICRO_LOT = 1_000
+
+pf = vbt.Portfolio.from_signals(
+    close, entries, exits,
+    size=MICRO_LOT,          # Trade 1 micro lot per signal
+    size_type='amount',
+    init_cash=10_000,        # USD account
+    fees=0.00005,            # ~0.5 pip spread on EURUSD (~$5 per standard lot)
+    freq='1H',
+)
+```
+
+### FX Fees / Spread
+
+FX brokers charge via the **bid-ask spread** rather than commission. Typical values:
+
+| Pair    | Typical Spread | As Decimal Fee (size_type='amount') |
+|---------|---------------|--------------------------------------|
+| EURUSD  | 0.5–1.5 pips  | 0.00005–0.00015 per unit             |
+| GBPUSD  | 1–2 pips      | 0.0001–0.0002 per unit               |
+| USDJPY  | 0.5–1.5 pips  | 0.005–0.015 per unit                 |
+| XAUUSD  | 3–8 pips      | 0.03–0.08 per unit                   |
+
+When using `size_type='percent'` or `size_type='value'`, model spread as a round-trip fraction:
+
+```python
+# 1 pip spread on EURUSD at price ~1.08, round-trip
+fees = (1 * 0.0001) / 1.08   # ~0.000093 per side, or use 0.0001 as conservative estimate
+```
+
+---
 
 ## VectorBT Simulation Modes
 
-### 1. from_signals (Signal-Based) - Most Common
-
-Entry/exit boolean arrays. VectorBT processes signals sequentially - after entry, waits for exit before next entry (unless `accumulate=True`).
+### 1. from_signals (Signal-Based) — Most Common for FX
 
 ```python
 import vectorbt as vbt
 import numpy as np
 
 pf = vbt.Portfolio.from_signals(
-    close,                      # Price series (required)
-    entries,                    # Boolean Series - True = buy signal
-    exits,                      # Boolean Series - True = sell signal
-    init_cash=1_000_000,        # Starting capital
-    fees=0.001,                 # 0.1% per trade
-    slippage=0.0005,            # 0.05% slippage
-    size=0.75,                  # Position size
-    size_type="percent",        # How to interpret size
-    direction="longonly",       # longonly, shortonly, both
-    freq="1D",                  # Data frequency
-    min_size=1,                 # Minimum order size
-    size_granularity=1,         # Round to whole shares
-    sl_stop=0.05,               # 5% stop loss (optional)
-    tp_stop=0.10,               # 10% take profit (optional)
-    accumulate=False,           # True = allow pyramiding
+    close,                      # Price series
+    entries,                    # Boolean Series — True = open long
+    exits,                      # Boolean Series — True = close long
+    init_cash=10_000,           # Account size in USD
+    fees=0.00005,               # Spread cost per unit (0.5 pip on EURUSD)
+    slippage=0.00002,           # Additional slippage
+    size=10_000,                # 1 mini lot (10,000 units)
+    size_type='amount',         # Fixed units per trade
+    direction='longonly',       # longonly, shortonly, both
+    freq='1H',                  # Data frequency
+    sl_stop=0.00278,            # 30 pip SL on EURUSD (30 * 0.0001 / 1.08)
+    tp_stop=0.00556,            # 60 pip TP on EURUSD (60 * 0.0001 / 1.08)
+    accumulate=False,
 )
 ```
 
-### 2. from_orders (Order-Based) - Direct Orders
-
-Provide explicit order arrays. Fastest simulation mode.
+### 2. from_orders (Rebalancing / Order-Based)
 
 ```python
 pf = vbt.Portfolio.from_orders(
     close=close,
-    size=0.15,                  # Target 15% allocation
-    size_type='targetpercent',  # Rebalances to target weight
-    group_by=True,              # Group columns as one portfolio
-    cash_sharing=True,          # Share cash across assets
-    fees=0.001,
-    init_cash=1_000_000,
-    freq='1D',
-    min_size=1,
-    size_granularity=1,
+    size=0.95,                  # 95% of available cash
+    size_type='percent',
+    fees=0.0001,
+    init_cash=10_000,
+    freq='1H',
 )
 ```
 
-### 3. from_order_func (Custom Callback) - Most Powerful
-
-Numba-compiled functions called at each bar with full portfolio state access. Use for complex logic. `flexible=True` allows multiple orders per symbol per bar.
-
-### 4. from_holding (Buy-and-Hold Benchmark)
+### 3. from_holding (Buy-and-Hold Benchmark)
 
 ```python
-pf_benchmark = vbt.Portfolio.from_holding(close, init_cash=1_000_000, fees=0.001)
+pf_benchmark = vbt.Portfolio.from_holding(close, init_cash=10_000, fees=0.0001)
 ```
 
-## Position Sizing
+---
 
-| SizeType | `size_type=` | `size=` meaning | Best For |
-|----------|-------------|-----------------|----------|
-| Amount | `"amount"` | Fixed number of shares | Simple testing |
-| Value | `"value"` | Fixed cash amount per trade | Fixed exposure |
-| Percent | `"percent"` | Fraction of current portfolio (0.5 = 50%) | Risk-adjusted trading |
-| TargetPercent | `"targetpercent"` | Target portfolio weight (rebalances) | Portfolio allocation |
-| TargetAmount | `"targetamount"` | Rebalance to target shares | Specific share targets |
-| TargetValue | `"targetvalue"` | Rebalance to target dollar value | Specific value targets |
+## Stop Loss & Take Profit — FX Complete Reference
 
-Default: `size=np.inf` with Amount = invest all available cash.
-
-### Percent Sizing (Most Popular)
-
-```python
-pf = vbt.Portfolio.from_signals(
-    close, entries, exits,
-    size=0.5,              # 50% of portfolio equity per trade
-    size_type="percent",
-    init_cash=1_000_000,
-    fees=0.001,
-    min_size=1,
-    size_granularity=1,
-    freq="1D"
-)
-```
-
-## Creating Indicators & Signals
-
-### RSI Strategy
-
-```python
-rsi = vbt.RSI.run(close, window=14)
-entries = rsi.rsi_crossed_below(30)   # Oversold = buy
-exits = rsi.rsi_crossed_above(70)     # Overbought = sell
-```
-
-### EMA Crossover Strategy
-
-```python
-ema_short = vbt.MA.run(close, 10, ewm=True, short_name='EMA10')
-ema_long = vbt.MA.run(close, 20, ewm=True, short_name='EMA20')
-
-entries = ema_short.ma_crossed_above(ema_long)
-exits = ema_short.ma_crossed_below(ema_long)
-```
-
-### SMA Crossover Strategy
-
-```python
-fast_ma = vbt.MA.run(close, window=10)
-slow_ma = vbt.MA.run(close, window=20)
-
-entries = fast_ma.ma_crossed_above(slow_ma)
-exits = fast_ma.ma_crossed_below(slow_ma)
-```
-
-## Stop Loss & Take Profit
-
-```python
-pf = vbt.Portfolio.from_signals(
-    close, entries, exits,
-    sl_stop=0.05,     # Exit if price drops 5% from entry
-    tp_stop=0.10,     # Exit if price rises 10% from entry
-    ts_stop=0.03,     # Trailing stop: 3% from highest price since entry
-    init_cash=1_000_000,
-    fees=0.001,
-    freq="1D"
-)
-```
-
-## Parameter Optimization
-
-### Method 1: Broadcasting (Vectorized - VectorBT's Killer Feature)
-
-Test thousands of parameter combinations simultaneously without loops:
-
-```python
-# Test 99 x 99 = 9,801 window combinations at once
-fast_ma = vbt.MA.run(close, window=np.arange(2, 101))
-slow_ma = vbt.MA.run(close, window=np.arange(2, 101))
-
-entries = fast_ma.ma_crossed_above(slow_ma)
-exits = fast_ma.ma_crossed_below(slow_ma)
-
-pf = vbt.Portfolio.from_signals(close, entries, exits, init_cash=100_000, fees=0.001, freq="1D")
-
-# Get total return for all combinations
-total_returns = pf.total_return()
-
-# Find best parameters
-best_idx = total_returns.idxmax()
-print(f"Best fast window: {best_idx[0]}, Best slow window: {best_idx[1]}")
-print(f"Best return: {total_returns.max():.2%}")
-```
-
-### Method 2: Loop-Based Optimization (EMA Crossover Example)
-
-When you need more control over each iteration or want to collect custom metrics:
+### Fixed SL/TP in Pips (Recommended for FX)
 
 ```python
 import vectorbt as vbt
+
+# Helper: convert pips to vectorbt sl_stop/tp_stop fraction
+def pips_to_frac(pips, pip_size, entry_price):
+    """Convert pip count to vectorbt stop fraction."""
+    return (pips * pip_size) / entry_price
+
+# --- EURUSD example ---
+close = df['close']
+entry_price_approx = close.mean()
+PIP = 0.0001
+
+sl_frac = pips_to_frac(30, PIP, entry_price_approx)   # 30 pip SL
+tp_frac = pips_to_frac(60, PIP, entry_price_approx)   # 60 pip TP (2:1 RR)
+
+pf = vbt.Portfolio.from_signals(
+    close, entries, exits,
+    init_cash=10_000,
+    size=10_000,               # 1 mini lot
+    size_type='amount',
+    fees=0.00005,
+    sl_stop=sl_frac,
+    tp_stop=tp_frac,
+    freq='1H',
+)
+```
+
+### Trailing Stop Loss
+
+```python
+# sl_trail: trails the highest price since entry, exits on pullback
+pf = vbt.Portfolio.from_signals(
+    close, entries, exits,
+    sl_trail=pips_to_frac(20, PIP, close.mean()),  # 20 pip trailing stop
+    init_cash=10_000,
+    size=10_000,
+    size_type='amount',
+    fees=0.00005,
+    freq='1H',
+)
+```
+
+### Per-Signal Dynamic SL/TP (Series-Based)
+
+Pass a pandas Series of the same index to set a different SL/TP per bar:
+
+```python
+# ATR-based dynamic stop loss
+import pandas_ta as pta
+
+atr = pta.atr(df['high'], df['low'], df['close'], length=14)
+sl_series = atr * 1.5 / close    # 1.5x ATR as fraction of price
+tp_series = atr * 3.0 / close    # 3x ATR (2:1 RR)
+
+pf = vbt.Portfolio.from_signals(
+    close, entries, exits,
+    sl_stop=sl_series,
+    tp_stop=tp_series,
+    init_cash=10_000,
+    size=10_000,
+    size_type='amount',
+    fees=0.00005,
+    freq='1H',
+)
+```
+
+### SL/TP Stop Parameters Reference
+
+| Parameter  | Description |
+|------------|-------------|
+| `sl_stop`  | Fixed stop loss — exits if price falls this fraction below entry |
+| `tp_stop`  | Fixed take profit — exits if price rises this fraction above entry |
+| `sl_trail` | Trailing stop — tracks highest price since entry, exits on pullback |
+| `ts_stop`  | Alias for `sl_trail` in some versions |
+
+**Notes:**
+- These work for `direction='longonly'`. For shorts, SL triggers above entry, TP below.
+- SL/TP always override signal exits — whichever fires first wins.
+- Use `stop_exit_price='close'` (default) or `'stop'` to choose fill price.
+
+---
+
+## FX Lot Sizing — Position Sizing Approaches
+
+### Approach 1: Fixed Lot Size (amount)
+
+Simple and realistic — each trade uses a fixed number of base currency units:
+
+```python
+# Trade 1 mini lot (10,000 units) every signal
+pf = vbt.Portfolio.from_signals(
+    close, entries, exits,
+    size=10_000,
+    size_type='amount',
+    init_cash=10_000,
+    fees=0.00005,
+    freq='1H',
+)
+```
+
+### Approach 2: Risk-Based Lot Sizing (% risk per trade)
+
+The professional approach — risk a fixed % of account per trade, sized by SL distance:
+
+```python
 import numpy as np
 
-# Parameter grid
-short_spans = np.arange(5, 15, 1)   # 5 to 14
-long_spans = np.arange(15, 30, 1)   # 15 to 29
+def compute_lot_size(account_equity, risk_pct, sl_pips, pip_value_per_lot, lot_units=100_000):
+    """
+    Compute lot size based on fixed % risk.
 
+    Args:
+        account_equity: Account balance in USD
+        risk_pct: Risk per trade as decimal (0.01 = 1%)
+        sl_pips: Stop loss distance in pips
+        pip_value_per_lot: USD value of 1 pip for 1 standard lot
+                           (for EURUSD ~$10, USDJPY ~$9, GBPUSD ~$10)
+        lot_units: Units per standard lot (default 100,000)
+    Returns:
+        units: Number of base currency units to trade
+    """
+    risk_amount = account_equity * risk_pct
+    lots = risk_amount / (sl_pips * pip_value_per_lot)
+    units = lots * lot_units
+    return units
+
+# Example: 1% risk, 30 pip SL on EURUSD
+account = 10_000
+risk_pct = 0.01      # 1%
+sl_pips = 30
+pip_value = 10.0     # $10 per pip per standard lot on EURUSD
+
+units = compute_lot_size(account, risk_pct, sl_pips, pip_value)
+print(f"Trade size: {units:.0f} units ({units/100_000:.2f} standard lots)")
+# => ~3,333 units = 0.03 standard lots
+```
+
+### Approach 3: Percent of Portfolio
+
+Simple — invest a fraction of current equity:
+
+```python
+pf = vbt.Portfolio.from_signals(
+    close, entries, exits,
+    size=0.95,              # 95% of available equity
+    size_type='percent',
+    init_cash=10_000,
+    fees=0.0001,
+    freq='1H',
+)
+```
+
+### Position Sizing Reference Table
+
+| `size_type` | `size=` meaning | Best For |
+|-------------|-----------------|----------|
+| `'amount'`  | Fixed units (e.g. 10,000 = 1 mini lot) | Realistic FX simulation |
+| `'value'`   | Fixed cash per trade in account currency | Fixed USD exposure |
+| `'percent'` | Fraction of current portfolio equity | Simple risk-adjusted |
+| `'targetpercent'` | Rebalance to target weight | Multi-asset portfolios |
+
+---
+
+## Parameter Optimization
+
+### Method 1: Broadcasting (Vectorized — VectorBT's Killer Feature)
+
+Test thousands of SL/TP or indicator combinations simultaneously:
+
+```python
+import numpy as np
+
+# Test 10 x 10 = 100 EMA pairs simultaneously
+ema_fast = vbt.MA.run(close, window=np.arange(5, 15), ewm=True)
+ema_slow = vbt.MA.run(close, window=np.arange(20, 55, 5), ewm=True)
+
+entries = ema_fast.ma_crossed_above(ema_slow)
+exits   = ema_fast.ma_crossed_below(ema_slow)
+
+pf = vbt.Portfolio.from_signals(
+    close, entries, exits,
+    init_cash=10_000,
+    size=10_000,
+    size_type='amount',
+    fees=0.00005,
+    freq='1H',
+)
+
+total_returns = pf.total_return()
+best_idx = total_returns.idxmax()
+print(f"Best fast EMA: {best_idx[0]}, slow EMA: {best_idx[1]}")
+print(f"Best return: {total_returns.max():.2%}")
+```
+
+### Method 2: Loop-Based (for SL/TP Grid Search)
+
+```python
 results = []
 
-for short_span in short_spans:
-    for long_span in long_spans:
-        short_ema = vbt.MA.run(close, short_span, short_name='fast', ewm=True)
-        long_ema = vbt.MA.run(close, long_span, short_name='slow', ewm=True)
+sl_pip_grid = [15, 20, 25, 30, 40, 50]
+rr_grid = [1.5, 2.0, 2.5, 3.0]   # Risk-reward ratios
 
-        entries = short_ema.ma_crossed_above(long_ema)
-        exits = short_ema.ma_crossed_below(long_ema)
+for sl_pips in sl_pip_grid:
+    for rr in rr_grid:
+        tp_pips = sl_pips * rr
+        sl_frac = (sl_pips * PIP) / close.mean()
+        tp_frac = (tp_pips * PIP) / close.mean()
 
-        portfolio = vbt.Portfolio.from_signals(
+        pf = vbt.Portfolio.from_signals(
             close, entries, exits,
-            size=0.5,
-            size_type='percent',
-            fees=0.001,
-            init_cash=100_000,
-            freq='1D',
-            min_size=1,
-            size_granularity=1,
+            init_cash=10_000,
+            size=10_000,
+            size_type='amount',
+            fees=0.00005,
+            sl_stop=sl_frac,
+            tp_stop=tp_frac,
+            freq='1H',
         )
 
         results.append({
-            'short_span': short_span,
-            'long_span': long_span,
-            'total_return': portfolio.total_return(),
-            'sharpe_ratio': portfolio.sharpe_ratio(),
-            'max_drawdown': portfolio.max_drawdown(),
-            'trade_count': portfolio.trades.count(),
+            'sl_pips': sl_pips,
+            'rr': rr,
+            'tp_pips': tp_pips,
+            'total_return': pf.total_return(),
+            'sharpe': pf.sharpe_ratio(),
+            'max_dd': pf.max_drawdown(),
+            'win_rate': pf.trades.win_rate(),
+            'trades': pf.trades.count(),
+            'profit_factor': pf.trades.profit_factor(),
         })
 
-# Convert to DataFrame for analysis
 results_df = pd.DataFrame(results)
 best = results_df.loc[results_df['total_return'].idxmax()]
-print(f"Best: Short EMA={int(best['short_span'])}, Long EMA={int(best['long_span'])}")
-print(f"Return: {best['total_return']:.2%}, Sharpe: {best['sharpe_ratio']:.2f}")
+print(f"Best SL: {best['sl_pips']} pips, RR: {best['rr']:.1f}")
+print(f"Return: {best['total_return']:.2%}, Sharpe: {best['sharpe']:.2f}")
 ```
+
+---
 
 ## Performance Analysis
 
 ### Full Stats
 
 ```python
-pf.stats()                          # Complete performance summary
+pf.stats()   # Complete performance summary
 ```
 
-### Individual Metrics
+### FX-Relevant Metrics
 
 ```python
 pf.total_return() * 100             # Total return %
-pf.sharpe_ratio()                   # Sharpe ratio
+pf.sharpe_ratio()                   # Sharpe ratio (annualized)
 pf.sortino_ratio()                  # Sortino ratio
-pf.max_drawdown()                   # Maximum drawdown
-pf.trades.win_rate()                # Win rate
-pf.trades.count()                   # Total trades
-pf.trades.profit_factor()           # Profit factor
+pf.calmar_ratio()                   # Calmar ratio (return / max DD)
+pf.max_drawdown() * 100             # Maximum drawdown %
+pf.trades.win_rate() * 100          # Win rate %
+pf.trades.profit_factor()           # Profit factor (gross wins / gross losses)
+pf.trades.count()                   # Total closed trades
+pf.trades.records_readable          # Full trade log DataFrame
 ```
 
-### Trade Records
+### Pip P&L per Trade
 
 ```python
-pf.trades.records_readable          # DataFrame of all trades
-pf.orders.records_readable          # DataFrame of all orders
-pf.positions.records_readable       # DataFrame of all positions
+trades = pf.trades.records_readable.copy()
+trades['pnl_pips'] = (trades['Exit Price'] - trades['Entry Price']) / PIP
+print(trades[['Entry Time', 'Exit Time', 'Entry Price', 'Exit Price', 'pnl_pips', 'PnL']].head(20))
+print(f"\nAvg pip gain per trade: {trades['pnl_pips'].mean():.1f} pips")
+print(f"Avg winning trade: {trades.loc[trades['pnl_pips'] > 0, 'pnl_pips'].mean():.1f} pips")
+print(f"Avg losing trade:  {trades.loc[trades['pnl_pips'] < 0, 'pnl_pips'].mean():.1f} pips")
 ```
 
-### Equity & Cash
+### Export Trade Log
 
 ```python
-pf.value()                          # Equity curve over time
-pf.cash()                           # Cash balance over time
+pf.trades.records_readable.to_csv('reports/trades.csv', index=False)
 ```
 
-### Export Trades
+---
+
+## Direction — Long, Short, Both
+
+| Direction    | `direction=` | Behavior |
+|--------------|-------------|----------|
+| Long Only    | `'longonly'` | Buy on entry, sell on exit (default) |
+| Short Only   | `'shortonly'` | Short on entry, cover on exit |
+| Both         | `'both'`    | Flip between long and short |
+
+### Long + Short Simultaneously
 
 ```python
-pf.positions.records_readable.to_csv("trades.csv", index=False)
+pf = vbt.Portfolio.from_signals(
+    close,
+    entries=long_entries,
+    exits=long_exits,
+    short_entries=short_entries,
+    short_exits=short_exits,
+    init_cash=10_000,
+    size=10_000,
+    size_type='amount',
+    fees=0.00005,
+    sl_stop=sl_frac,
+    tp_stop=tp_frac,
+    freq='1H',
+)
 ```
 
-### Benchmark Comparison
+---
 
-```python
-import yfinance as yf
+## Key Parameters Reference
 
-# Build benchmark returns
-nifty = yf.download("^NSEI", start=close.index.min(), end=close.index.max(),
-                    auto_adjust=True, multi_level_index=False)["Close"]
-bench_rets = nifty.reindex(close.index).ffill().bfill().vbt.to_returns()
-pf.returns_stats(benchmark_rets=bench_rets)
-```
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `init_cash` | 100 | Starting capital in account currency (USD) |
+| `fees` | 0 | Fee per unit traded (model spread as `pip_size / price`) |
+| `fixed_fees` | 0 | Flat fee per trade in account currency |
+| `slippage` | 0 | Additional slippage as fraction of price |
+| `size` | np.inf | Position size (interpretation depends on `size_type`) |
+| `size_type` | `'amount'` | How to interpret `size` |
+| `direction` | `'longonly'` | Trade direction |
+| `freq` | auto | Data frequency string (`'1T'`, `'1H'`, `'4H'`, `'1D'`) |
+| `accumulate` | False | Allow pyramiding into existing positions |
+| `sl_stop` | None | Stop loss as fraction of entry price |
+| `tp_stop` | None | Take profit as fraction of entry price |
+| `sl_trail` | None | Trailing stop as fraction (tracks high watermark) |
+| `min_size` | 0 | Minimum order size |
+| `size_granularity` | None | Round size to this increment |
+| `stop_exit_price` | `'close'` | Fill price for SL/TP: `'close'` or `'stop'` |
 
 ## Plotting
 
 ### Built-in Plots
 
 ```python
-fig = pf.plot()                                         # Full portfolio plot
+fig = pf.plot()
 fig.show()
 
-fig = pf.plot(subplots=['cum_returns'])                 # Cumulative returns
+fig = pf.plot(subplots=['value', 'underwater'])           # Equity + drawdown
 fig.show()
 
-fig = pf.plot_cum_returns()                             # Dedicated cumulative returns
-fig.show()
-
-fig = pf.plot(subplots=['value', 'underwater'])         # Equity + drawdown
-fig.show()
-
-fig = pf.plot(subplots=['drawdowns', 'underwater'])     # Drawdown periods
+fig = pf.plot(subplots=['value', 'underwater', 'cum_returns', 'trades'])
 fig.show()
 ```
 
-### Available Subplots
+### Save to Reports
 
 ```python
-list(pf.subplots.keys())   # See all available subplot names
-# Common: 'value', 'cum_returns', 'underwater', 'drawdowns', 'trades', 'orders'
+from utils import save_plot
+
+save_plot(fig, 'reports/my_strategy_EURUSD_1H.html')
 ```
 
-### Custom Subplot Settings
+### Full 7-Panel Plot
 
 ```python
 fig = pf.plot(
-    subplots=['value', 'underwater'],
-    subplot_settings={
-        'value': {'title': 'Equity Curve'},
-        'underwater': {'title': 'Drawdown', 'yaxis_kwargs': {'tickformat': '.1%'}}
-    }
+    subplots=['value', 'underwater', 'drawdowns', 'orders', 'trades', 'net_exposure', 'cash'],
+    make_subplots_kwargs=dict(
+        rows=7, cols=1, shared_xaxes=True, vertical_spacing=0.04,
+        row_heights=[0.25, 0.12, 0.12, 0.16, 0.12, 0.12, 0.11],
+    ),
+    template='plotly_dark',
+    title='FX Strategy Backtest Results',
 )
 fig.show()
 ```
 
-### Custom Strategy vs Benchmark Chart (Plotly)
+### Pip P&L Distribution Chart
 
 ```python
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 
-cum_pf = pf.value() / pf.value().iloc[0] - 1
-cum_bm = (nifty / nifty.iloc[0] - 1).reindex(cum_pf.index).ffill().bfill()
-dd_pf = cum_pf / cum_pf.cummax() - 1
+trades = pf.trades.records_readable.copy()
+trades['pnl_pips'] = (trades['Exit Price'] - trades['Entry Price']) / PIP
 
-fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                    row_heights=[0.65, 0.35], vertical_spacing=0.07)
-fig.add_trace(go.Scatter(x=cum_pf.index, y=cum_pf, name='Strategy (cum %)'), row=1, col=1)
-fig.add_trace(go.Scatter(x=cum_bm.index, y=cum_bm, name='NIFTY 50 (cum %)'), row=1, col=1)
-fig.add_trace(go.Scatter(x=dd_pf.index, y=dd_pf, name='Drawdown', mode='lines'), row=2, col=1)
-fig.update_yaxes(tickformat='.1%', row=1, col=1)
-fig.update_yaxes(title_text='Drawdown', tickformat='.1%', row=2, col=1)
-fig.update_layout(title='Cumulative Returns vs NIFTY 50 + Drawdown')
+fig = go.Figure()
+fig.add_trace(go.Histogram(
+    x=trades['pnl_pips'],
+    nbinsx=40,
+    marker_color=trades['pnl_pips'].apply(lambda x: 'green' if x > 0 else 'red'),
+    name='Pip P&L Distribution',
+))
+fig.update_layout(
+    title='Trade P&L Distribution (pips)',
+    xaxis_title='Pips',
+    yaxis_title='Count',
+    template='plotly_dark',
+)
 fig.show()
 ```
 
-## Direction
-
-| Direction | `direction=` | Behavior |
-|-----------|-------------|----------|
-| Long Only | `"longonly"` | Only buy and sell (default) |
-| Short Only | `"shortonly"` | Only short and cover |
-| Both | `"both"` | Can go long and short |
-
-## Key Parameters Reference
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `init_cash` | 100 | Starting capital |
-| `fees` | 0 | Transaction fee as decimal (0.001 = 0.1%) |
-| `fixed_fees` | 0 | Flat fee per trade |
-| `slippage` | 0 | Price slippage as decimal |
-| `size` | np.inf | Position size |
-| `size_type` | Amount | How to interpret size |
-| `direction` | longonly | Trade direction |
-| `freq` | auto | Data frequency (1D, 1H, 5T, etc.) |
-| `accumulate` | False | Allow pyramiding |
-| `sl_stop` | None | Stop loss (decimal, e.g. 0.05 = 5%) |
-| `tp_stop` | None | Take profit (decimal) |
-| `ts_stop` | None | Trailing stop (decimal) |
-| `min_size` | 0 | Minimum order size |
-| `size_granularity` | None | Round size to this increment |
-
-## Template: Full Backtest Script with OpenAlgo Data
-
-```python
-import os
-from datetime import datetime, timedelta
-from pathlib import Path
-
-import numpy as np
-import pandas as pd
-import vectorbt as vbt
-from dotenv import load_dotenv
-from openalgo import api
-
-# --- Config ---
-script_dir = Path(__file__).resolve().parent
-load_dotenv(dotenv_path=script_dir / ".env", override=False)
-
-SYMBOL = os.getenv("OPENALGO_SYMBOL", "SBIN")
-EXCHANGE = os.getenv("OPENALGO_EXCHANGE", "NSE")
-INTERVAL = os.getenv("OPENALGO_INTERVAL", "D")
-INIT_CASH = 1_000_000
-FEES = 0.001
-ALLOCATION = 0.75
-
-# --- Fetch Data ---
-client = api(
-    api_key=os.getenv("OPENALGO_API_KEY"),
-    host=os.getenv("OPENALGO_HOST", "http://127.0.0.1:5000"),
-)
-
-end_date = datetime.now().date()
-start_date = end_date - timedelta(days=365 * 3)
-
-df = client.history(
-    symbol=SYMBOL,
-    exchange=EXCHANGE,
-    interval=INTERVAL,
-    start_date=start_date.strftime("%Y-%m-%d"),
-    end_date=end_date.strftime("%Y-%m-%d"),
-)
-
-if "timestamp" in df.columns:
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
-    df = df.set_index("timestamp")
-else:
-    df.index = pd.to_datetime(df.index)
-
-df = df.sort_index()
-close = df["close"]
-
-# --- Strategy: EMA Crossover ---
-ema_short = vbt.MA.run(close, 10, ewm=True, short_name='EMA10')
-ema_long = vbt.MA.run(close, 20, ewm=True, short_name='EMA20')
-
-entries = ema_short.ma_crossed_above(ema_long)
-exits = ema_short.ma_crossed_below(ema_long)
-
-# --- Backtest ---
-pf = vbt.Portfolio.from_signals(
-    close,
-    entries,
-    exits,
-    init_cash=INIT_CASH,
-    size=ALLOCATION,
-    size_type="percent",
-    fees=FEES,
-    direction="longonly",
-    min_size=1,
-    size_granularity=1,
-    freq="1D",
-)
-
-# --- Results ---
-print(pf.stats())
-print(f"\nTotal Return: {pf.total_return() * 100:.2f}%")
-print(f"Sharpe Ratio: {pf.sharpe_ratio():.2f}")
-print(f"Max Drawdown: {pf.max_drawdown() * 100:.2f}%")
-print(f"Win Rate: {pf.trades.win_rate() * 100:.1f}%")
-print(f"Total Trades: {pf.trades.count()}")
-
-# --- Plot ---
-fig = pf.plot(subplots=['value', 'underwater', 'cum_returns'])
-fig.show()
-
-# --- Export ---
-pf.positions.records_readable.to_csv(
-    script_dir / f"{SYMBOL}_backtest_trades.csv", index=False
-)
-```
+---
 
 ## Common Patterns
 
-### Multiple Timeframe Data Fetch
+### Avoid Lookahead Bias
+
+Always use `.shift(1)` when comparing current bar value to a previous computation:
 
 ```python
-# Daily data
-df_daily = client.history(symbol="RELIANCE", exchange="NSE", interval="D",
-                          start_date="2024-01-01", end_date="2025-02-25")
+# WRONG — uses current bar's SMA to generate a signal on the same bar
+entries_bad = close > sma
 
-# 5-minute intraday data
-df_5m = client.history(symbol="RELIANCE", exchange="NSE", interval="5m",
-                       start_date="2025-02-01", end_date="2025-02-25")
+# CORRECT — signal fires on the bar AFTER the condition is met
+entries_good = close > sma.shift(1)
 ```
 
-### Multi-Asset Portfolio
+### Signal Deduplication (prevent stacking entries)
 
 ```python
-symbols = ["RELIANCE", "HDFCBANK", "INFY", "TCS"]
-dfs = {}
-for sym in symbols:
-    dfs[sym] = client.history(symbol=sym, exchange="NSE", interval="D",
-                              start_date="2024-01-01", end_date="2025-02-25")
-
-close_prices = pd.DataFrame({sym: dfs[sym]["close"] for sym in symbols})
+# Ensure no duplicate consecutive entries/exits
+entries = entries & ~entries.shift(1).fillna(False)
+exits   = exits & ~exits.shift(1).fillna(False)
 ```
 
-### Random Signal Baseline
+### Save / Load Portfolio
 
 ```python
-pf_random = vbt.Portfolio.from_random_signals(close, n=50, init_cash=1_000_000, fees=0.001)
+pf.save('reports/my_backtest.pkl')
+pf_loaded = vbt.Portfolio.load('reports/my_backtest.pkl')
 ```
 
-### Save/Load Portfolio
+### Benchmark Comparison (Buy and Hold)
 
 ```python
-pf.save("my_backtest.pkl")
-pf_loaded = vbt.Portfolio.load("my_backtest.pkl")
-```
+pf_bh = vbt.Portfolio.from_holding(close, init_cash=10_000, fees=0.0001, freq='1H')
 
----
-
-## OpenAlgo TA Helper Functions (`openalgo.ta`)
-
-The `openalgo` package provides signal helper functions critical for clean signal generation:
-
-```python
-from openalgo import ta
-
-# exrem: Remove excess signals - keeps only first entry before an exit, first exit before an entry
-# Prevents duplicate consecutive buy/sell signals
-entries = ta.exrem(buy_raw, sell_raw)
-exits = ta.exrem(sell_raw, buy_raw)
-
-# crossover: True when series1 crosses above series2
-cross_up = ta.crossover(close, upper_band)
-
-# crossunder: True when series1 crosses below series2
-cross_down = ta.crossunder(close, lower_band)
-
-# flip: Returns True regime from trigger1 until trigger2 fires (and vice versa)
-bull_regime = ta.flip(bull_trigger, bear_trigger)
-bear_regime = ta.flip(bear_trigger, bull_trigger)
-
-# donchian: Returns (upper, middle, lower) Donchian channel
-upper, middle, lower = ta.donchian(high, low, period=20)
-
-# supertrend: Returns (supertrend_line, direction)
-st_line, st_direction = ta.supertrend(high, low, close, period=10, multiplier=3.0)
-```
-
----
-
-## CSV Data Loading & Resampling
-
-### Load Minute-Level CSV Data
-
-```python
-import pandas as pd
-from pathlib import Path
-
-csv_file = Path("data") / "NIFTYF.csv"
-df = pd.read_csv(
-    csv_file,
-    usecols=["Ticker", "Date", "Time", "Open", "High", "Low", "Close", "Volume"]
-)
-
-# Build datetime index
-df["datetime"] = pd.to_datetime(df["Date"] + " " + df["Time"])
-df = df.set_index("datetime").sort_index()
-df = df.drop(columns=["Date", "Time", "Ticker"])
-```
-
-### Resample to Different Timeframes
-
-```python
-def resample_df(df, tf="D"):
-    if tf == "D":
-        return df.resample("D").agg({
-            "Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"
-        }).dropna()
-    elif tf == "H":
-        # 60-min bars aligned to Indian market open (09:15)
-        return df.resample("60min", origin="start_day", offset="9h15min").agg({
-            "Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"
-        }).dropna()
-    elif tf == "5min":
-        return df.resample("5min", origin="start_day", offset="9h15min",
-                           label="right", closed="right").agg({
-            "Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"
-        }).dropna()
-    else:
-        raise ValueError("Unsupported timeframe")
-
-timeframe = "H"
-df_resampled = resample_df(df, tf=timeframe)
-close = df_resampled["Close"]
-```
-
----
-
-## Futures Backtesting (Lot Size)
-
-For NIFTY/BANKNIFTY futures, use `min_size` and `size_granularity` set to the lot size, and `size_type="value"` for fixed capital deployment:
-
-```python
-lot_size = 75  # NIFTY Futures lot size
-pf = vbt.Portfolio.from_signals(
-    close, entries, exits,
-    init_cash=30_00_000,        # 30 lakh
-    size=20_00_000,             # Deploy 20L of 30L per trade
-    size_type="value",
-    direction="longonly",
-    fees=0.0003,                # 0.03% for futures
-    min_size=lot_size,          # Minimum = 1 lot
-    size_granularity=lot_size,  # Round to lot multiples
-    freq="1D" if timeframe == "D" else "1h",
-)
-```
-
-Common lot sizes: NIFTY=75, BANKNIFTY=30, Stock futures=varies (see LOTSIZE.csv).
-
----
-
-## Strategy Catalog
-
-### 1. EMA Crossover with TA-Lib
-
-```python
-import talib as tl
-from openalgo import ta
-
-fast_period, slow_period = 12, 26
-ema_fast = pd.Series(tl.EMA(close.values, timeperiod=fast_period), index=close.index)
-ema_slow = pd.Series(tl.EMA(close.values, timeperiod=slow_period), index=close.index)
-
-buy_raw = (ema_fast > ema_slow) & (ema_fast.shift(1) <= ema_slow.shift(1))
-sell_raw = (ema_fast < ema_slow) & (ema_fast.shift(1) >= ema_slow.shift(1))
-
-entries = ta.exrem(buy_raw.fillna(False), sell_raw.fillna(False))
-exits = ta.exrem(sell_raw.fillna(False), buy_raw.fillna(False))
-```
-
-### 2. Donchian Channel Breakout
-
-```python
-from openalgo import ta
-
-upper, middle, lower = ta.donchian(df["HIGH"], df["LOW"], period=20)
-
-# Use shifted levels (previous bar's channel) to avoid lookahead
-upper_shifted = upper.shift(1)
-lower_shifted = lower.shift(1)
-
-entries = pd.Series(ta.crossover(df["CLOSE"], upper_shifted), index=df.index)
-exits = pd.Series(ta.crossunder(df["CLOSE"], lower_shifted), index=df.index)
-```
-
-### 3. Momentum (MOM) Strategy - Long & Short
-
-```python
-import talib as tl
-from openalgo import ta
-
-LENGTH = 12
-mom0 = pd.Series(tl.MOM(close.values, timeperiod=LENGTH), index=close.index)
-mom1 = pd.Series(tl.MOM(mom0.values, timeperiod=1), index=close.index)
-
-# Conditions
-cond_long = (mom0 > 0) & (mom1 > 0)
-cond_short = (mom0 < 0) & (mom1 < 0)
-
-# Next-bar fill (shift conditions by 1, confirm with price breakout)
-prev_high = high.shift(1)
-prev_low = low.shift(1)
-MINTICK = 0.05
-
-entries_long = (cond_long.shift(1) & (high >= (prev_high + MINTICK))).fillna(False)
-entries_short = (cond_short.shift(1) & (low <= (prev_low - MINTICK))).fillna(False)
-
-# Clean overlapping signals
-entries_long = ta.exrem(entries_long, entries_short)
-entries_short = ta.exrem(entries_short, entries_long)
-
-# Exits = opposite entry
-exits_long = entries_short
-exits_short = entries_long
-```
-
-### 4. MACD Signal-Candle Breakout
-
-```python
-import talib as tl
-from openalgo import ta
-
-macd, macd_signal, macd_hist = tl.MACD(close.values, fastperiod=12, slowperiod=26, signalperiod=9)
-macd_series = pd.Series(macd, index=close.index)
-zero = pd.Series(0.0, index=close.index)
-
-# MACD zero-line flips define regimes
-bull_flip = ta.crossover(macd_series, zero)
-bear_flip = ta.crossunder(macd_series, zero)
-
-bull_regime = ta.flip(bull_flip, bear_flip)
-bear_regime = ta.flip(bear_flip, bull_flip)
-
-# Signal candle levels (capture and carry forward)
-sig_high = high.where(bull_flip).ffill()
-sig_low = low.where(bear_flip).ffill()
-
-# Entries: price breaks signal candle level during matching regime
-long_entry_raw = ta.crossover(high, sig_high) & bull_regime
-short_entry_raw = ta.crossunder(low, sig_low) & bear_regime
-
-# Only first entry per regime
-entries_long = ta.exrem(long_entry_raw, bear_flip)
-entries_short = ta.exrem(short_entry_raw, bull_flip)
-
-# Exits on opposite regime flip
-exits_long = ta.exrem(bear_flip, entries_long)
-exits_short = ta.exrem(bull_flip, entries_short)
-```
-
-### 5. SDA2 Trend Following System
-
-```python
-import talib as tl
-from openalgo import ta
-
-# SDA2 Channel: WMA of ((H+L)/2 + (O-C)) with STDDEV and ATR bands
-base = ((high + low) / 2.0) + (df_resampled["Open"] - close)
-derived = pd.Series(tl.WMA(base.astype(float).values, timeperiod=3), index=close.index)
-
-sd7 = pd.Series(tl.STDDEV(derived.values, timeperiod=7, nbdev=1.0), index=close.index)
-atr2 = pd.Series(tl.ATR(high.values, low.values, close.values, timeperiod=2), index=close.index)
-
-upper = derived + sd7 + (atr2 / 1.5)
-lower = derived - sd7 - (atr2 / 1.0)
-
-# Entry/Exit: price crosses channel bands
-entries = (close > upper) & (close.shift(1) <= upper.shift(1))
-exits = (lower > close) & (lower.shift(1) <= close.shift(1))
-
-entries = ta.exrem(entries.fillna(False), exits.fillna(False))
-exits = ta.exrem(exits.fillna(False), entries)
-```
-
-### 6. Supertrend Intraday (with Time-Based Exit)
-
-```python
-from openalgo import ta
-from datetime import time
-
-# Supertrend indicator
-st_line, st_direction = ta.supertrend(df5["HIGH"], df5["LOW"], df5["CLOSE"],
-                                       period=10, multiplier=3.0)
-
-close = df5["CLOSE"]
-t = df5.index.time
-
-# Cross signals
-cross_up = (close > st_line) & (close.shift(1) <= st_line.shift(1))
-cross_down = (close < st_line) & (close.shift(1) >= st_line.shift(1))
-
-# Time windows: entries 09:30-15:00, forced exit at 15:15
-entry_window = (t >= time(9, 30)) & (t <= time(15, 0))
-at_1515 = (t == time(15, 15))
-
-long_entries = cross_up & entry_window
-long_exits = cross_down | at_1515
-short_entries = cross_down & entry_window
-short_exits = cross_up | at_1515
-```
-
-### 7. Dual Momentum (NIFTYBEES vs GOLDBEES)
-
-```python
-import numpy as np
-import vectorbt as vbt
-
-# Assumes panel DataFrame with close_NIFTYBEES, close_GOLDBEES columns
-# Resample to 3-month periods
-res_3m_close = pd.DataFrame({
-    "NIFTYBEES": panel["close_NIFTYBEES"].resample("3ME").last(),
-    "GOLDBEES": panel["close_GOLDBEES"].resample("3ME").last(),
-}).dropna(how="all")
-
-# 3M returns determine winner
-ret_3m = res_3m_close.pct_change()
-winner_3m = np.where(ret_3m["NIFTYBEES"] >= ret_3m["GOLDBEES"], "NIFTYBEES", "GOLDBEES")
-winner_3m = pd.Series(winner_3m, index=ret_3m.index)
-
-# Build daily allocation from 3M decisions (applied from next bar)
-alloc_daily = pd.Series(index=panel.index, dtype="object")
-for dt, val in winner_3m.items():
-    next_idx_pos = panel.index.searchsorted(dt, side="right")
-    if next_idx_pos < len(panel.index):
-        alloc_daily.loc[panel.index[next_idx_pos]] = val
-alloc_daily = alloc_daily.ffill().loc[alloc_daily.first_valid_index():]
-
-# Build target weights
-weights = pd.DataFrame(index=alloc_daily.index, columns=["NIFTYBEES", "GOLDBEES"], dtype=float)
-weights["NIFTYBEES"] = (alloc_daily == "NIFTYBEES").astype(float)
-weights["GOLDBEES"] = (alloc_daily == "GOLDBEES").astype(float)
-
-switch_mask = alloc_daily.ne(alloc_daily.shift(1))
-switch_mask.iloc[0] = True
-target_on_switch = weights.where(switch_mask, np.nan)
-
-# Execute with targetpercent and cash_sharing
-price_df = pd.DataFrame({
-    "NIFTYBEES": panel.loc[alloc_daily.index, "open_NIFTYBEES"],
-    "GOLDBEES": panel.loc[alloc_daily.index, "open_GOLDBEES"],
-})
-
-pf = vbt.Portfolio.from_orders(
-    close=price_df,
-    size=target_on_switch,
-    size_type="targetpercent",
-    fees=0.0025,
-    init_cash=1_000_000,
-    cash_sharing=True,
-    call_seq="auto",
-    freq="1D",
-)
-```
-
----
-
-## Long + Short Backtesting
-
-Use `short_entries` and `short_exits` for simultaneous long/short:
-
-```python
-# Long + Short (both directions)
-pf_both = vbt.Portfolio.from_signals(
-    close,
-    entries=entries_long,
-    exits=exits_long,
-    short_entries=entries_short,
-    short_exits=exits_short,
-    init_cash=30_00_000,
-    size=20_00_000,
-    size_type="value",
-    fees=0.0003,
-    min_size=lot_size,
-    size_granularity=lot_size,
-    freq="1h",
-)
-# Note: direction="both" is ignored when short_entries/short_exits are provided
-```
-
-### Compare Long-Only vs Short-Only vs Both
-
-```python
-common_kwargs = dict(
-    init_cash=1_000_000,
-    size=500_000,
-    size_type="value",
-    fees=0.00022,
-    freq="5min",
-)
-
-EMPTY = pd.Series(False, index=close.index)
-
-pf_long = vbt.Portfolio.from_signals(close, entries=LE, exits=LX,
-                                      direction="longonly", **common_kwargs)
-pf_short = vbt.Portfolio.from_signals(close, short_entries=SE, short_exits=SX,
-                                       direction="shortonly", **common_kwargs)
-pf_both = vbt.Portfolio.from_signals(close, entries=LE, exits=LX,
-                                      short_entries=SE, short_exits=SX, **common_kwargs)
-
-# Side-by-side comparison
 stats = pd.concat([
-    pf_long.stats().to_frame("Long Only"),
-    pf_short.stats().to_frame("Short Only"),
-    pf_both.stats().to_frame("Both"),
+    pf.stats().to_frame('Strategy'),
+    pf_bh.stats().to_frame('Buy & Hold'),
 ], axis=1)
 print(stats)
-```
-
----
-
-## Optimization Heatmap Visualization
-
-```python
-import plotly.graph_objects as go
-
-# Pivot results for heatmap (from loop-based optimization)
-pivot_return = results_df.pivot_table(
-    values='total_return',
-    index='long_span',
-    columns='short_span',
-    aggfunc='first',
-)
-
-fig = go.Figure(data=go.Heatmap(
-    z=pivot_return.values * 100,
-    x=pivot_return.columns,
-    y=pivot_return.index,
-    colorscale='RdYlGn',
-    text=np.round(pivot_return.values * 100, 1),
-    texttemplate='%{text}%',
-    textfont={"size": 8},
-    colorbar=dict(title="Return %"),
-))
-fig.update_layout(
-    title="EMA Crossover Optimization - Total Return Heatmap",
-    xaxis_title="Fast EMA Period",
-    yaxis_title="Slow EMA Period",
-    template="plotly_dark",
-    height=800,
-    width=800,
-)
-fig.show()
 ```
 
 ---
@@ -977,83 +715,66 @@ fig.show()
 ## Consecutive Wins/Losses Analysis
 
 ```python
-def analyze_consecutive_trades(pf):
-    """Analyze max consecutive wins and losses from a portfolio."""
-    trades_df = pf.trades.records_readable
+def analyze_streaks(pf, pip_size=0.0001):
+    trades_df = pf.trades.records_readable.copy()
     if len(trades_df) == 0:
         return {}
 
-    pnl_list = ((trades_df['Exit Price'] - trades_df['Entry Price']) > 0).tolist()
+    trades_df['pnl_pips'] = (trades_df['Exit Price'] - trades_df['Entry Price']) / pip_size
+    wins = (trades_df['pnl_pips'] > 0).tolist()
 
-    consecutive_wins, consecutive_losses = [], []
-    current_wins, current_losses = 0, 0
-
-    for is_win in pnl_list:
-        if is_win:
-            if current_losses > 0:
-                consecutive_losses.append(current_losses)
-                current_losses = 0
-            current_wins += 1
+    cons_wins, cons_losses = [], []
+    cw, cl = 0, 0
+    for w in wins:
+        if w:
+            if cl > 0: cons_losses.append(cl); cl = 0
+            cw += 1
         else:
-            if current_wins > 0:
-                consecutive_wins.append(current_wins)
-                current_wins = 0
-            current_losses += 1
-
-    if current_wins > 0:
-        consecutive_wins.append(current_wins)
-    if current_losses > 0:
-        consecutive_losses.append(current_losses)
+            if cw > 0: cons_wins.append(cw); cw = 0
+            cl += 1
+    if cw > 0: cons_wins.append(cw)
+    if cl > 0: cons_losses.append(cl)
 
     return {
-        'max_consecutive_wins': max(consecutive_wins) if consecutive_wins else 0,
-        'max_consecutive_losses': max(consecutive_losses) if consecutive_losses else 0,
-        'avg_consecutive_wins': np.mean(consecutive_wins) if consecutive_wins else 0,
-        'avg_consecutive_losses': np.mean(consecutive_losses) if consecutive_losses else 0,
+        'max_consecutive_wins': max(cons_wins) if cons_wins else 0,
+        'max_consecutive_losses': max(cons_losses) if cons_losses else 0,
+        'avg_consecutive_wins': round(np.mean(cons_wins), 1) if cons_wins else 0,
+        'avg_consecutive_losses': round(np.mean(cons_losses), 1) if cons_losses else 0,
+        'avg_win_pips': round(trades_df.loc[trades_df['pnl_pips'] > 0, 'pnl_pips'].mean(), 1),
+        'avg_loss_pips': round(trades_df.loc[trades_df['pnl_pips'] < 0, 'pnl_pips'].mean(), 1),
     }
 ```
 
 ---
 
-## Full VectorBT Plot Pack (7-Panel)
+## SL/TP Optimization Heatmap
 
 ```python
-fig = pf.plot(
-    subplots=[
-        "value",          # equity curve
-        "underwater",     # % drawdown over time
-        "drawdowns",      # top-N drawdown ranges
-        "orders",         # buy/sell markers
-        "trades",         # entry/exit lines
-        "net_exposure",   # net exposure
-        "cash",           # cash curve
-    ],
-    make_subplots_kwargs=dict(
-        rows=7, cols=1, shared_xaxes=True, vertical_spacing=0.04,
-        row_heights=[0.25, 0.12, 0.12, 0.16, 0.12, 0.12, 0.11],
-    ),
-    template="plotly_dark",
-    title="Strategy Backtest Results",
+import plotly.graph_objects as go
+import numpy as np
+
+# After running grid search into results_df
+pivot = results_df.pivot_table(
+    values='total_return', index='rr', columns='sl_pips', aggfunc='first'
+)
+
+fig = go.Figure(data=go.Heatmap(
+    z=pivot.values * 100,
+    x=pivot.columns.astype(str) + ' pip SL',
+    y=pivot.index.astype(str) + ':1 RR',
+    colorscale='RdYlGn',
+    text=np.round(pivot.values * 100, 1),
+    texttemplate='%{text}%',
+    textfont={'size': 10},
+    colorbar=dict(title='Return %'),
+))
+fig.update_layout(
+    title='SL / Risk-Reward Optimization — Total Return',
+    xaxis_title='Stop Loss (pips)',
+    yaxis_title='Risk:Reward Ratio',
+    template='plotly_dark',
+    height=600,
+    width=800,
 )
 fig.show()
-```
-
----
-
-## Stop Loss Variations
-
-```python
-# Fixed stop loss + take profit
-pf = vbt.Portfolio.from_signals(
-    close, entries, exits,
-    sl_stop=0.05, tp_stop=0.10,          # 5% SL, 10% TP
-    fees=0.0003, init_cash=30_00_000, freq="1D",
-)
-
-# Trailing stop loss (follows price up, exits on pullback)
-pf = vbt.Portfolio.from_signals(
-    close, entries, exits,
-    sl_trail=0.05,                        # 5% trailing stop
-    fees=0.0003, init_cash=30_00_000, freq="1D",
-)
 ```
