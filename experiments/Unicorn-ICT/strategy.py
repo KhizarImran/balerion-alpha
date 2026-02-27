@@ -180,6 +180,8 @@ def detect_unicorn_setups(
     bear_fvg_arm_top_arr = np.full(n, np.nan)
     bear_fvg_arm_bot_arr = np.full(n, np.nan)
     sell_signal_arr = np.zeros(n, dtype=bool)
+    sell_sl_price_arr = np.full(n, np.nan)  # SL price at sell signal bar
+    sell_tp_price_arr = np.full(n, np.nan)  # TP price at sell signal bar
 
     bull_sweep_arr = np.zeros(n, dtype=bool)
     bull_choch_arr = np.zeros(n, dtype=bool)
@@ -187,14 +189,24 @@ def detect_unicorn_setups(
     bull_fvg_arm_top_arr = np.full(n, np.nan)
     bull_fvg_arm_bot_arr = np.full(n, np.nan)
     buy_signal_arr = np.zeros(n, dtype=bool)
+    buy_sl_price_arr = np.full(n, np.nan)  # SL price at buy signal bar
+    buy_tp_price_arr = np.full(n, np.nan)  # TP price at buy signal bar
 
     # ---- rolling pivot trackers ----
     last_pivot_high = np.nan
     last_pivot_low = np.nan
+    second_last_pivot_high = (
+        np.nan
+    )  # pivot high before the current last — used as TP for buys
+    second_last_pivot_low = (
+        np.nan
+    )  # pivot low  before the current last — used as TP for sells
 
     # Bear state machine variables
     bear_state = "idle"  # idle | swept | armed
-    bear_choch_level = np.nan
+    bear_choch_level = np.nan  # pivot low to break for CHoCH
+    bear_sweep_high = np.nan  # high of the sweep bar (SL goes above this)
+    bear_tp_level = np.nan  # prior pivot low — the liquidity target below
     bear_sweep_bar = -1
     bear_arm_bar = -1  # bar when armed (for fvg_timeout)
     bear_fvg_top_val = np.nan
@@ -202,7 +214,9 @@ def detect_unicorn_setups(
 
     # Bull state machine variables
     bull_state = "idle"
-    bull_choch_level = np.nan
+    bull_choch_level = np.nan  # pivot high to break for CHoCH
+    bull_sweep_low = np.nan  # low of the sweep bar (SL goes below this)
+    bull_tp_level = np.nan  # prior pivot high — the liquidity target above
     bull_sweep_bar = -1
     bull_arm_bar = -1
     bull_fvg_top_val = np.nan
@@ -215,8 +229,10 @@ def detect_unicorn_setups(
 
         # --- Update rolling pivot trackers ---
         if not np.isnan(ph[i]):
+            second_last_pivot_high = last_pivot_high
             last_pivot_high = ph[i]
         if not np.isnan(pl[i]):
+            second_last_pivot_low = last_pivot_low
             last_pivot_low = pl[i]
 
         # ==================================================================
@@ -238,6 +254,9 @@ def detect_unicorn_setups(
                 if h > last_pivot_high:
                     bear_state = "swept"
                     bear_choch_level = last_pivot_low
+                    bear_sweep_high = h
+                    # TP: next liquidity pool below — the pivot low before the CHoCH level
+                    bear_tp_level = second_last_pivot_low
                     bear_sweep_bar = i
                     bear_sweep_arr[i] = True
 
@@ -272,6 +291,14 @@ def detect_unicorn_setups(
             # Entry: high retraces into the bearish FVG zone
             if h >= bear_fvg_bot_val:
                 sell_signal_arr[i] = True
+                # SL: above the sweep high; TP: prior pivot low (next liquidity target)
+                sell_sl_price_arr[i] = bear_sweep_high
+                sell_tp_price_arr[i] = (
+                    bear_tp_level if not np.isnan(bear_tp_level) else bear_choch_level
+                )
+                bear_state = "idle"
+            # Invalidate: price closes above the FVG top (zone fully violated)
+            elif c > bear_fvg_top_val:
                 bear_state = "idle"
             # Invalidate: price closes above the FVG top (zone fully violated)
             elif c > bear_fvg_top_val:
@@ -294,6 +321,9 @@ def detect_unicorn_setups(
                 if l < last_pivot_low:
                     bull_state = "swept"
                     bull_choch_level = last_pivot_high
+                    bull_sweep_low = l
+                    # TP: next liquidity pool above — the pivot high before the CHoCH level
+                    bull_tp_level = second_last_pivot_high
                     bull_sweep_bar = i
                     bull_sweep_arr[i] = True
 
@@ -326,6 +356,14 @@ def detect_unicorn_setups(
             # Entry: low retraces into the bullish FVG zone
             if l <= bull_fvg_top_val:
                 buy_signal_arr[i] = True
+                # SL: below the sweep low; TP: prior pivot high (next liquidity target)
+                buy_sl_price_arr[i] = bull_sweep_low
+                buy_tp_price_arr[i] = (
+                    bull_tp_level if not np.isnan(bull_tp_level) else bull_choch_level
+                )
+                bull_state = "idle"
+            # Invalidate: price closes below the FVG bottom
+            elif c < bull_fvg_bot_val:
                 bull_state = "idle"
             # Invalidate: price closes below the FVG bottom
             elif c < bull_fvg_bot_val:
@@ -338,6 +376,8 @@ def detect_unicorn_setups(
     df["bear_fvg_arm_top"] = bear_fvg_arm_top_arr
     df["bear_fvg_arm_bot"] = bear_fvg_arm_bot_arr
     df["sell_signal"] = sell_signal_arr
+    df["sell_sl_price"] = sell_sl_price_arr
+    df["sell_tp_price"] = sell_tp_price_arr
 
     df["bull_sweep"] = bull_sweep_arr
     df["bull_choch"] = bull_choch_arr
@@ -345,6 +385,8 @@ def detect_unicorn_setups(
     df["bull_fvg_arm_top"] = bull_fvg_arm_top_arr
     df["bull_fvg_arm_bot"] = bull_fvg_arm_bot_arr
     df["buy_signal"] = buy_signal_arr
+    df["buy_sl_price"] = buy_sl_price_arr
+    df["buy_tp_price"] = buy_tp_price_arr
 
     return df
 

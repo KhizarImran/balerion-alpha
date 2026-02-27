@@ -1,0 +1,42 @@
+Traceback (most recent call last):
+  File "<string>", line 10, in <module>
+  File "C:\Users\Administrator\Desktop\quant\balerion-alpha\experiments/Unicorn-ICT/backtest.py", line 390, in run_backtest
+    y=entry_equity[loss_mask],
+      ~~~~~~~~~~~~^^^^^^^^^^^
+  File "C:\Users\Administrator\Desktop\quant\balerion-alpha\.venv\Lib\site-packages\pandas\core\series.py", line 987, in __getitem__
+    key = check_bool_indexer(self.index, key)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\Desktop\quant\balerion-alpha\.venv\Lib\site-packages\pandas\core\indexing.py", line 2677, in check_bool_indexer
+    raise IndexingError(
+pandas.errors.IndexingError: Unalignable boolean Series provided as indexer (index of the boolean Series and of the indexed object do not match).
+Loading EURUSD 1-minute data (2025-10-01 to 2026-02-27)...
+  Loaded 100,006 1-minute bars.
+Resampling to 1H and detecting Unicorn setups...
+  1,674 hourly bars  |  Buy signals: 7  |  Sell signals: 9
+  After R:R >= 1.5 filter: 2 long entries, 0 short entries
+  Mean SL distance: 0.060% of price
+  Position size   : 95.0% of equity per trade
+Running vectorbt backtest...
+
+============================================================
+ ICT UNICORN — EURUSD 1H BACKTEST RESULTS
+ Period  : 2025-10-01 to 2026-02-27
+ Capital : $10,000   Fees: 0.0070% per side
+ R:R min : 1.5   SL buffer: 2.0 pips
+============================================================
+ Total Return     : -0.20%
+ Final Value      : $9980.01
+ Sharpe Ratio     : -3.90
+ Sortino Ratio    : -3.91
+ Max Drawdown     : -0.20%
+ Total Trades     : 2
+ Win Rate         : 0.0%
+ Profit Factor    : 0.00
+ Avg Win          : nan
+ Avg Loss         : -9.99
+============================================================
+ Long      : 2 trades | win rate 0.0% | total PnL $-19.99
+============================================================
+
+  Report saved   -> C:\Users\Administrator\Desktop\quant\balerion-alpha\experiments\Unicorn-ICT\reports\unicorn_ict_EURUSD_backtest_report.txt
+  Trades saved   -> C:\Users\Administrator\Desktop\quant\balerion-alpha\experiments\Unicorn-ICT\reports\unicorn_ict_EURUSD_trades.csv
