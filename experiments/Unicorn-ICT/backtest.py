@@ -11,10 +11,12 @@ Risk management per trade:
 Target risk-reward >= 1:2.  Trades where the setup geometry produces a R:R below
 a configurable minimum are filtered out before simulation.
 
-Outputs saved to experiments/Unicorn-ICT/reports/:
-  - unicorn_ict_EURUSD_backtest_report.txt   full stats
-  - unicorn_ict_EURUSD_trades.csv            trade-by-trade log
-  - unicorn_ict_EURUSD_equity.html           interactive equity + drawdown chart
+Outputs saved to experiments/Unicorn-ICT/reports/{SYMBOL}_{YYYYMMDD_HHMMSS}/:
+  - backtest_report.txt   full stats
+  - trades.csv            trade-by-trade log
+  - equity.html           interactive equity + drawdown chart
+  - vbt_report.html       native vectorbt 7-panel performance chart
+  - portfolio.pkl         raw Portfolio object for reloading
 """
 
 import sys
@@ -28,6 +30,7 @@ import pandas as pd
 import vectorbt as vbt
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from datetime import datetime
 
 from utils import DataLoader
 
@@ -49,8 +52,17 @@ SYMBOL = "EURUSD"
 ASSET_TYPE = "fx"
 START_DATE = "2025-10-01"
 END_DATE = "2026-02-27"
-INIT_CASH = 10_000  # USD account size
-RISK_PER_TRADE = 0.01  # 1% of equity risked per trade
+
+# Account
+ACCOUNT_SIZE = 10_000  # real margin capital in USD
+LEVERAGE = 100  # 1:100 retail FX leverage
+RISK_PER_TRADE = 0.01  # 1% of account risked per trade
+
+# FX instrument constants (EURUSD)
+PIP = 0.0001  # pip size for 4-decimal pairs
+PIP_VALUE_PER_LOT = 10.0  # USD value of 1 pip on 1 standard lot (EURUSD, USD account)
+STD_LOT = 100_000  # units per standard lot
+
 FX_FEES = 0.00007  # ~0.7 pip spread per side (round trip ~1.4 pip)
 MIN_RR = 1.5  # minimum R:R ratio — trades below this are skipped
 SL_BUFFER = 0.0002  # 2 pip buffer added beyond sweep high/low for SL
@@ -126,20 +138,34 @@ def build_per_bar_stops(
     return filtered_signal, sl_series, tp_series
 
 
-def size_from_risk(
-    equity: float, sl_frac: float, risk_pct: float = RISK_PER_TRADE
+def compute_lot_units(
+    account_equity: float,
+    sl_frac: float,
+    entry_price: float,
+    risk_pct: float = RISK_PER_TRADE,
+    pip_size: float = PIP,
+    pip_value_per_lot: float = PIP_VALUE_PER_LOT,
+    std_lot: float = STD_LOT,
 ) -> float:
     """
-    Compute position size so that hitting SL loses exactly risk_pct of equity.
-    Returns fraction of equity to allocate (size_type='percent').
+    Compute position size in base currency units so that hitting SL loses
+    exactly risk_pct of account equity.
 
-    size * equity * sl_frac = risk_pct * equity
-    => size = risk_pct / sl_frac
-    capped at 1.0 (100% of equity).
+    Derivation:
+        risk_$      = account_equity * risk_pct
+        sl_pips     = sl_frac * entry_price / pip_size
+        lots        = risk_$ / (sl_pips * pip_value_per_lot)
+        units       = lots * std_lot
+
+    Returns units (float) — pass as size= with size_type='amount'.
+    Returns 0.0 if sl_frac is zero or negative.
     """
-    if sl_frac <= 0:
+    if sl_frac <= 0 or entry_price <= 0:
         return 0.0
-    return min(risk_pct / sl_frac, 1.0)
+    risk_dollars = account_equity * risk_pct
+    sl_pips = (sl_frac * entry_price) / pip_size
+    lots = risk_dollars / (sl_pips * pip_value_per_lot)
+    return lots * std_lot
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +177,8 @@ def run_backtest(
     symbol: str = SYMBOL,
     start_date: str = START_DATE,
     end_date: str = END_DATE,
-    init_cash: float = INIT_CASH,
+    account_size: float = ACCOUNT_SIZE,
+    leverage: int = LEVERAGE,
     risk_per_trade: float = RISK_PER_TRADE,
     min_rr: float = MIN_RR,
     sl_buffer: float = SL_BUFFER,
@@ -210,41 +237,66 @@ def run_backtest(
         return None
 
     # ------------------------------------------------------------------
-    # 3. Position sizing: risk-based, computed per signal bar
-    #    We pass a single size_type='percent' value; because each trade has
-    #    a different SL distance we compute an average fractional size.
-    #    For per-trade exact sizing use from_order_func — this approach uses
-    #    a conservative fixed 1% allocation which approximates 1% risk given
-    #    typical SL distances on EURUSD 1H.
+    # 3. Position sizing — risk-based lot sizing with leverage
+    #
+    #    With 1:100 leverage a $10,000 account controls $1,000,000 notional.
+    #    Margin required per standard lot = 100,000 / 100 = $1,000.
+    #
+    #    We size each trade so that hitting the SL costs exactly
+    #    risk_per_trade * account_size in USD:
+    #
+    #        risk_$   = account_size * risk_per_trade
+    #        sl_pips  = sl_frac * entry_price / PIP
+    #        lots     = risk_$ / (sl_pips * PIP_VALUE_PER_LOT)
+    #        units    = lots * STD_LOT
+    #
+    #    vectorbt is passed init_cash = account_size * leverage (notional
+    #    buying power) so it has sufficient cash to fill the lot sizes.
+    #    Real P&L and returns are re-anchored to account_size afterwards.
     # ------------------------------------------------------------------
-    # Compute mean SL fraction across all valid signals for sizing reference
-    all_sl = pd.concat(
-        [
-            long_sl[long_entries],
-            short_sl[short_entries],
-        ]
-    ).dropna()
+    entry_price_approx = close.mean()
 
-    if len(all_sl) > 0:
-        mean_sl_frac = all_sl.mean()
-        position_size = min(risk_per_trade / mean_sl_frac, 0.95)
-    else:
-        mean_sl_frac = 0.0
-        position_size = risk_per_trade
+    # Build a per-signal-bar Series of lot units
+    all_signals = long_entries | short_entries
+    combined_sl = long_sl.fillna(short_sl)
 
-    print(f"  Mean SL distance: {mean_sl_frac * 100:.3f}% of price")
-    print(f"  Position size   : {position_size * 100:.1f}% of equity per trade")
+    lot_units_series = pd.Series(0.0, index=df.index)
+    for ts in df.index[all_signals]:
+        sl_frac = combined_sl.loc[ts]
+        if np.isnan(sl_frac) or sl_frac <= 0:
+            continue
+        units = compute_lot_units(
+            account_equity=account_size,
+            sl_frac=sl_frac,
+            entry_price=close.loc[ts],
+            risk_pct=risk_per_trade,
+        )
+        lot_units_series.loc[ts] = units
+
+    mean_units = lot_units_series[all_signals].replace(0, np.nan).mean()
+    mean_sl_frac = combined_sl[all_signals].dropna().mean()
+    mean_sl_pips = (mean_sl_frac * entry_price_approx) / PIP if mean_sl_frac > 0 else 0
+
+    print(
+        f"  Mean SL distance   : {mean_sl_pips:.1f} pips  ({mean_sl_frac * 100:.3f}% of price)"
+    )
+    print(
+        f"  Mean lot size      : {mean_units / STD_LOT:.3f} standard lots  ({mean_units:,.0f} units)"
+    )
+    print(
+        f"  Risk per trade     : ${account_size * risk_per_trade:,.0f}  ({risk_per_trade * 100:.1f}% of ${account_size:,})"
+    )
+    print(
+        f"  Notional per trade : ${mean_units * entry_price_approx:,.0f}  (margin: ${mean_units * entry_price_approx / leverage:,.0f})"
+    )
 
     # ------------------------------------------------------------------
     # 4. Run vectorbt simulation (long + short simultaneously)
     # ------------------------------------------------------------------
     print("Running vectorbt backtest...")
 
-    # sl_stop / tp_stop as per-bar Series — vectorbt reads the value at
-    # the entry bar and applies it as a fixed fraction from entry price.
-    # Forward-fill so every bar has a value (vectorbt needs aligned series).
-    # Non-signal bars carry NaN which vectorbt ignores for non-open positions.
-
+    # init_cash = notional buying power (account_size * leverage) so vectorbt
+    # can fill the full lot sizes. Real return is computed against account_size.
     pf = vbt.Portfolio.from_signals(
         close=close,
         entries=long_entries,
@@ -253,39 +305,54 @@ def run_backtest(
         short_exits=pd.Series(False, index=df.index),
         sl_stop=long_sl.fillna(short_sl).fillna(0),
         tp_stop=long_tp.fillna(short_tp).fillna(0),
-        init_cash=init_cash,
-        size=position_size,
-        size_type="percent",
+        init_cash=account_size * leverage,  # notional buying power
+        size=lot_units_series,  # per-bar lot units
+        size_type="amount",
         fees=FX_FEES,
         freq=FREQ,
         accumulate=False,
     )
+
+    # Re-anchor equity to real margin capital
+    abs_pnl = pf.value().iloc[-1] - (account_size * leverage)
+    return_on_margin = (abs_pnl / account_size) * 100
 
     # ------------------------------------------------------------------
     # 5. Print stats
     # ------------------------------------------------------------------
     stats = pf.stats()
 
+    # Patch stats so Start Value / End Value / Total Return reflect the
+    # real margin account ($10,000) rather than the notional ($1,000,000)
+    stats["Start Value"] = account_size
+    stats["End Value"] = account_size + abs_pnl
+    stats["Total Return [%]"] = return_on_margin
+
     print("\n" + "=" * 60)
-    print(f" ICT UNICORN — EURUSD 1H BACKTEST RESULTS")
-    print(f" Period  : {start_date} to {end_date}")
-    print(f" Capital : ${init_cash:,.0f}   Fees: {FX_FEES * 100:.4f}% per side")
-    print(f" R:R min : {min_rr}   SL buffer: {sl_buffer * 10000:.1f} pips")
+    print(f" ICT UNICORN — {symbol} 1H BACKTEST RESULTS")
+    print(f" Period   : {start_date} to {end_date}")
+    print(
+        f" Account  : ${account_size:,}  |  Leverage: {leverage}:1  |  Notional: ${account_size * leverage:,}"
+    )
+    print(
+        f" Risk/trade: {risk_per_trade * 100:.1f}%  (${account_size * risk_per_trade:,.0f})  |  Fees: {FX_FEES * 10000:.1f} pips/side"
+    )
+    print(f" R:R min  : {min_rr}  |  SL buffer: {sl_buffer * 10000:.1f} pips")
     print("=" * 60)
-    print(f" Total Return     : {pf.total_return() * 100:.2f}%")
-    print(f" Final Value      : ${pf.final_value():.2f}")
+    print(f" Abs P&L          : ${abs_pnl:+,.2f}")
+    print(
+        f" Return on Margin : {return_on_margin:+.2f}%  (on ${account_size:,} margin)"
+    )
+    print(f" Final Value      : ${account_size + abs_pnl:,.2f}")
     print(f" Sharpe Ratio     : {pf.sharpe_ratio():.2f}")
     print(f" Sortino Ratio    : {pf.sortino_ratio():.2f}")
     print(f" Max Drawdown     : {pf.max_drawdown() * 100:.2f}%")
     print(f" Total Trades     : {pf.trades.count()}")
     print(f" Win Rate         : {pf.trades.win_rate() * 100:.1f}%")
     print(f" Profit Factor    : {pf.trades.profit_factor():.2f}")
-    print(
-        f" Avg Win          : {pf.trades.records_readable['PnL'].where(pf.trades.records_readable['PnL'] > 0).mean():.2f}"
-    )
-    print(
-        f" Avg Loss         : {pf.trades.records_readable['PnL'].where(pf.trades.records_readable['PnL'] < 0).mean():.2f}"
-    )
+    trades_pnl = pf.trades.records_readable["PnL"]
+    print(f" Avg Win          : ${trades_pnl.where(trades_pnl > 0).mean():.2f}")
+    print(f" Avg Loss         : ${trades_pnl.where(trades_pnl < 0).mean():.2f}")
     print("=" * 60)
 
     # Separate long vs short breakdown
@@ -304,29 +371,71 @@ def run_backtest(
     # ------------------------------------------------------------------
     # 6. Save outputs
     # ------------------------------------------------------------------
-    reports_dir = Path(__file__).resolve().parent / "reports"
-    reports_dir.mkdir(exist_ok=True)
+    run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    reports_dir = Path(__file__).resolve().parent / "reports" / f"{symbol}_{run_ts}"
+    reports_dir.mkdir(parents=True, exist_ok=True)
 
     if save_outputs:
         # Text report
-        report_path = reports_dir / f"unicorn_ict_{symbol}_backtest_report.txt"
+        report_path = reports_dir / "backtest_report.txt"
         with open(report_path, "w") as f:
             f.write(f"ICT Unicorn Model — {symbol} 1H Backtest\n")
-            f.write(f"Period  : {start_date} to {end_date}\n")
-            f.write(f"Capital : ${init_cash:,.0f}\n")
-            f.write(f"R:R min : {min_rr}   SL buffer: {sl_buffer * 10000:.1f} pips\n\n")
+            f.write(f"Period    : {start_date} to {end_date}\n")
+            f.write(f"Account   : ${account_size:,}  |  Leverage: {leverage}:1\n")
+            f.write(
+                f"Risk/trade: {risk_per_trade * 100:.1f}%  (${account_size * risk_per_trade:,.0f})\n"
+            )
+            f.write(
+                f"R:R min   : {min_rr}   SL buffer: {sl_buffer * 10000:.1f} pips\n\n"
+            )
             f.write(str(stats))
-            f.write(f"\n\nTotal Return  : {pf.total_return() * 100:.2f}%\n")
-            f.write(f"Sharpe Ratio  : {pf.sharpe_ratio():.2f}\n")
-            f.write(f"Max Drawdown  : {pf.max_drawdown() * 100:.2f}%\n")
-            f.write(f"Win Rate      : {pf.trades.win_rate() * 100:.1f}%\n")
-            f.write(f"Profit Factor : {pf.trades.profit_factor():.2f}\n")
+            f.write(f"\n\nAbs P&L           : ${abs_pnl:+,.2f}\n")
+            f.write(
+                f"Return on Margin  : {return_on_margin:+.2f}%  (on ${account_size:,})\n"
+            )
+            f.write(f"Sharpe Ratio      : {pf.sharpe_ratio():.2f}\n")
+            f.write(f"Max Drawdown      : {pf.max_drawdown() * 100:.2f}%\n")
+            f.write(f"Win Rate          : {pf.trades.win_rate() * 100:.1f}%\n")
+            f.write(f"Profit Factor     : {pf.trades.profit_factor():.2f}\n")
         print(f"\n  Report saved   -> {report_path}")
 
         # Trades CSV
-        trades_path = reports_dir / f"unicorn_ict_{symbol}_trades.csv"
+        trades_path = reports_dir / "trades.csv"
         trades_df.to_csv(trades_path)
         print(f"  Trades saved   -> {trades_path}")
+
+        # Native vectorbt 7-panel performance report
+        # Disable FigureWidget (requires anywidget) — use plain Plotly Figure instead
+        vbt.settings.plotting["use_widgets"] = False
+        print("  Building native VBT report chart...")
+        vbt_fig = pf.plot(
+            subplots=[
+                "value",  # equity curve
+                "cum_returns",  # cumulative return %
+                "underwater",  # drawdown filled area
+                "drawdowns",  # top drawdown period bands
+                "orders",  # buy/sell markers on price
+                "trades",  # entry/exit lines per trade
+                "net_exposure",  # net exposure over time
+            ],
+            make_subplots_kwargs=dict(
+                rows=7,
+                cols=1,
+                shared_xaxes=True,
+                vertical_spacing=0.04,
+                row_heights=[0.22, 0.12, 0.12, 0.14, 0.14, 0.14, 0.12],
+            ),
+            template="plotly_dark",
+            title=f"ICT Unicorn — {symbol} 1H  |  VectorBT Performance Report",
+        )
+        vbt_chart_path = reports_dir / "vbt_report.html"
+        vbt_fig.write_html(str(vbt_chart_path))
+        print(f"  VBT report     -> {vbt_chart_path}")
+
+        # Raw Portfolio object — reload later without re-running backtest
+        pkl_path = reports_dir / "portfolio.pkl"
+        pf.save(str(pkl_path))
+        print(f"  Portfolio pkl  -> {pkl_path}")
 
     # ------------------------------------------------------------------
     # 7. Equity + drawdown chart
@@ -442,9 +551,10 @@ def run_backtest(
     fig.update_xaxes(title_text="Date", row=2, col=1)
 
     if save_outputs:
-        chart_path = reports_dir / f"unicorn_ict_{symbol}_equity.html"
+        chart_path = reports_dir / "equity.html"
         fig.write_html(str(chart_path))
         print(f"  Equity chart   -> {chart_path}")
+        print(f"\n  All outputs in -> {reports_dir}")
 
     if show_chart:
         fig.show()

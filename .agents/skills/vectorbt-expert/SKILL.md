@@ -627,49 +627,175 @@ print(stats)
 
 ---
 
-## Plotting
+## Saving Backtest Outputs
 
-### Built-in Plots
+Every backtest should save all outputs into a **timestamped run folder** so each run is isolated and nothing is overwritten. The pattern used across this project is:
+
+```
+experiments/<strategy-name>/reports/{SYMBOL}_{YYYYMMDD_HHMMSS}/
+    backtest_report.txt   — full pf.stats() + key metrics
+    trades.csv            — trade-by-trade log
+    vbt_report.html       — native vectorbt 7-panel interactive chart
+    equity.html           — custom equity + drawdown chart
+    portfolio.pkl         — raw Portfolio object for reloading
+```
+
+### Standard Save Block (use this in every backtest.py)
 
 ```python
-fig = pf.plot()
-fig.show()
+from datetime import datetime
+from pathlib import Path
 
-fig = pf.plot(subplots=['value', 'underwater'])
-fig.show()
+# Create timestamped run folder
+run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+reports_dir = Path(__file__).resolve().parent / "reports" / f"{symbol}_{run_ts}"
+reports_dir.mkdir(parents=True, exist_ok=True)
 
-fig = pf.plot(subplots=['value', 'underwater', 'cum_returns', 'trades'])
-fig.show()
+# 1. Stats text report
+report_path = reports_dir / "backtest_report.txt"
+with open(report_path, "w") as f:
+    f.write(str(pf.stats()))
+    f.write(f"\n\nTotal Return  : {pf.total_return() * 100:.2f}%\n")
+    f.write(f"Sharpe Ratio  : {pf.sharpe_ratio():.2f}\n")
+    f.write(f"Max Drawdown  : {pf.max_drawdown() * 100:.2f}%\n")
+    f.write(f"Win Rate      : {pf.trades.win_rate() * 100:.1f}%\n")
+    f.write(f"Profit Factor : {pf.trades.profit_factor():.2f}\n")
+print(f"  Report saved   -> {report_path}")
+
+# 2. Trades CSV
+trades_path = reports_dir / "trades.csv"
+pf.trades.records_readable.to_csv(trades_path)
+print(f"  Trades saved   -> {trades_path}")
+
+# 3. Native vectorbt 7-panel performance chart
+# IMPORTANT: disable FigureWidget to avoid anywidget ImportError when saving to HTML
+vbt.settings.plotting["use_widgets"] = False
+vbt_fig = pf.plot(
+    subplots=[
+        "value",        # equity curve
+        "cum_returns",  # cumulative return %
+        "underwater",   # drawdown filled area
+        "drawdowns",    # top drawdown period bands
+        "orders",       # buy/sell markers on price
+        "trades",       # entry/exit lines per trade
+        "net_exposure", # net exposure over time
+    ],
+    make_subplots_kwargs=dict(
+        rows=7,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.04,
+        row_heights=[0.22, 0.12, 0.12, 0.14, 0.14, 0.14, 0.12],
+    ),
+    template="plotly_dark",
+    title=f"{symbol} — VectorBT Performance Report",
+)
+vbt_chart_path = reports_dir / "vbt_report.html"
+vbt_fig.write_html(str(vbt_chart_path))
+print(f"  VBT report     -> {vbt_chart_path}")
+
+# 4. Raw Portfolio object — reload without re-running the backtest
+pkl_path = reports_dir / "portfolio.pkl"
+pf.save(str(pkl_path))
+print(f"  Portfolio pkl  -> {pkl_path}")
+
+print(f"\n  All outputs in -> {reports_dir}")
+```
+
+### Reloading a Saved Portfolio
+
+```python
+import vectorbt as vbt
+
+pf = vbt.Portfolio.load("experiments/Unicorn-ICT/reports/EURUSD_20260227_143022/portfolio.pkl")
+
+# All methods available immediately — no need to re-run the backtest
+print(pf.stats())
+pf.plot().show()
+pf.trades.records_readable
 ```
 
 ### Available Subplots
 
 ```python
 list(pf.subplots.keys())
-# Common: 'value', 'cum_returns', 'underwater', 'drawdowns', 'trades', 'orders', 'net_exposure', 'cash'
+# Common: 'value', 'cum_returns', 'underwater', 'drawdowns',
+#         'trades', 'orders', 'net_exposure', 'cash'
 ```
 
-### Full 7-Panel Plot
+### Custom Equity + Drawdown Chart (with win/loss dots)
+
+A manually built chart that marks individual winning and losing trades on the equity curve:
 
 ```python
-fig = pf.plot(
-    subplots=['value', 'underwater', 'drawdowns', 'orders', 'trades', 'net_exposure', 'cash'],
-    make_subplots_kwargs=dict(
-        rows=7, cols=1, shared_xaxes=True, vertical_spacing=0.04,
-        row_heights=[0.25, 0.12, 0.12, 0.16, 0.12, 0.12, 0.11],
-    ),
-    template='plotly_dark',
-    title='FX Strategy Backtest Results',
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+equity = pf.value()
+dd = (equity - equity.cummax()) / equity.cummax() * 100
+trades_df = pf.trades.records_readable.copy()
+
+fig = make_subplots(
+    rows=2, cols=1, shared_xaxes=True,
+    vertical_spacing=0.05, row_heights=[0.65, 0.35],
+    subplot_titles=(f"{symbol} — Equity Curve", "Drawdown %"),
 )
-fig.show()
-```
 
-### Save to Reports
+fig.add_trace(go.Scatter(
+    x=equity.index, y=equity, name="Equity",
+    line=dict(color="#26a69a", width=2),
+    fill="tozeroy", fillcolor="rgba(38,166,154,0.08)",
+), row=1, col=1)
 
-```python
-reports_dir = project_root / 'reports'
-reports_dir.mkdir(exist_ok=True)
-fig.write_html(str(reports_dir / 'my_strategy_EURUSD_1H.html'))
+# Win / loss dots on the equity curve
+if len(trades_df) > 0:
+    entry_times  = pd.to_datetime(trades_df["Entry Timestamp"].values)
+    entry_equity = equity.reindex(entry_times, method="nearest").values
+    win_mask  = (trades_df["PnL"] > 0).values
+    loss_mask = (trades_df["PnL"] <= 0).values
+
+    if win_mask.any():
+        fig.add_trace(go.Scatter(
+            x=entry_times[win_mask], y=entry_equity[win_mask],
+            mode="markers", name="Win",
+            marker=dict(symbol="circle", size=8, color="#00e676",
+                        line=dict(color="#1b5e20", width=1)),
+        ), row=1, col=1)
+
+    if loss_mask.any():
+        fig.add_trace(go.Scatter(
+            x=entry_times[loss_mask], y=entry_equity[loss_mask],
+            mode="markers", name="Loss",
+            marker=dict(symbol="circle", size=8, color="#f44336",
+                        line=dict(color="#b71c1c", width=1)),
+        ), row=1, col=1)
+
+fig.add_trace(go.Scatter(
+    x=dd.index, y=dd, name="Drawdown",
+    line=dict(color="#ef5350", width=1),
+    fill="tozeroy", fillcolor="rgba(239,83,80,0.15)",
+), row=2, col=1)
+
+fig.update_layout(
+    height=700, template="plotly_dark", hovermode="x unified",
+    title=dict(
+        text=(
+            f"<b>{symbol}</b><br>"
+            f"<sup>Return: {pf.total_return()*100:.2f}%  |  "
+            f"Sharpe: {pf.sharpe_ratio():.2f}  |  "
+            f"Win Rate: {pf.trades.win_rate()*100:.1f}%  |  "
+            f"Trades: {pf.trades.count()}  |  "
+            f"Max DD: {pf.max_drawdown()*100:.2f}%</sup>"
+        ),
+        x=0.5, xanchor="center",
+    ),
+)
+fig.update_yaxes(title_text="Portfolio Value ($)", row=1, col=1)
+fig.update_yaxes(title_text="Drawdown (%)", row=2, col=1)
+
+chart_path = reports_dir / "equity.html"
+fig.write_html(str(chart_path))
+print(f"  Equity chart   -> {chart_path}")
 ```
 
 ### Pip P&L Distribution Chart
@@ -677,10 +803,10 @@ fig.write_html(str(reports_dir / 'my_strategy_EURUSD_1H.html'))
 ```python
 import plotly.graph_objects as go
 
+PIP = 0.0001  # adjust per pair
 trades = pf.trades.records_readable.copy()
 trades['pnl_pips'] = (trades['Exit Price'] - trades['Entry Price']) / PIP
 
-colors = trades['pnl_pips'].apply(lambda x: 'green' if x > 0 else 'red')
 fig = go.Figure()
 fig.add_trace(go.Histogram(x=trades['pnl_pips'], nbinsx=40, name='Pip P&L'))
 fig.update_layout(
@@ -689,28 +815,8 @@ fig.update_layout(
     yaxis_title='Count',
     template='plotly_dark',
 )
-fig.show()
-```
-
-### Equity vs Buy-and-Hold Chart
-
-```python
-from plotly.subplots import make_subplots
-
-pf_bh = vbt.Portfolio.from_holding(close, init_cash=10_000, fees=0.0001, freq='1H')
-
-cum_strat = pf.value() / pf.value().iloc[0] - 1
-cum_bh    = pf_bh.value() / pf_bh.value().iloc[0] - 1
-drawdown  = cum_strat / cum_strat.cummax() - 1
-
-fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                    row_heights=[0.65, 0.35], vertical_spacing=0.07)
-fig.add_trace(go.Scatter(x=cum_strat.index, y=cum_strat, name='Strategy'), row=1, col=1)
-fig.add_trace(go.Scatter(x=cum_bh.index,    y=cum_bh,    name='Buy & Hold'), row=1, col=1)
-fig.add_trace(go.Scatter(x=drawdown.index,  y=drawdown,  name='Drawdown'), row=2, col=1)
-fig.update_yaxes(tickformat='.1%', row=1, col=1)
-fig.update_yaxes(tickformat='.1%', row=2, col=1)
-fig.update_layout(title='Strategy vs Buy & Hold', template='plotly_dark')
+pip_dist_path = reports_dir / "pip_distribution.html"
+fig.write_html(str(pip_dist_path))
 fig.show()
 ```
 

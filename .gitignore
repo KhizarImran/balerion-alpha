@@ -44,12 +44,9 @@ env/
 htmlcov/
 .tox/
 
-# Reports (generated output files)
-reports/**/*.html
-reports/**/*.png
-reports/**/*.jpg
-reports/**/*.txt
-reports/**/*.csv
+# Reports (generated output files — project-level and per-experiment)
+reports/
+experiments/**/reports/
 
 # Logs
 *.log

@@ -53,28 +53,33 @@ balerion-alpha/ (this repo)
 
 ```
 balerion-alpha/
-├── .agents/skills/vectorbt-expert/SKILL.md  # AI skill: comprehensive vectorbt reference
-├── backtesting/          # Planned: vectorbt backtesting scripts (currently empty)
+├── .agents/skills/vectorbt-expert/SKILL.md  # AI skill: comprehensive vectorbt + FX reference
+├── backtesting/          # Standalone vectorbt scripts (currently empty)
 ├── config/               # Configuration files (currently empty)
 ├── experiments/          # Strategy experiments — the main working area
-│   ├── sma_crossover/    # Complete working experiment
+│   ├── sma_crossover/    # SMA crossover experiment
 │   │   ├── strategy.py   # Signal generation + visualization
 │   │   └── README.md
-│   └── silver-bullet/    # Placeholder — ICT strategy (currently empty)
+│   ├── silver-bullet/    # ICT Silver Bullet strategy (US30, 1-minute)
+│   │   ├── strategy.py   # Signal generation + visualization
+│   │   ├── backtest.py   # vectorbt backtest → reports/ (project root)
+│   │   └── optimize.py   # Parameter optimization
+│   └── Unicorn-ICT/      # ICT Unicorn Model (EURUSD, 1H)
+│       ├── strategy.py   # Signal generation + visualization
+│       ├── backtest.py   # vectorbt backtest → reports/{SYMBOL}_{timestamp}/
+│       └── reports/      # Per-run timestamped output folders (gitignored)
 ├── notebooks/            # Jupyter notebooks (currently empty)
-├── reports/              # Generated HTML charts (gitignored — never commit)
+├── reports/              # Project-level generated outputs (gitignored — never commit)
 ├── src/balerion_alpha/   # Package scaffold (stub only — not used)
 ├── tests/                # Unit tests (currently empty)
 ├── utils/                # Core shared library
 │   ├── __init__.py       # Exports: DataLoader, load_data, plot_* functions
 │   ├── data_loader.py    # Loads Parquet data from ../balerion-data/data/
 │   └── plotting.py       # Plotly dark-themed chart utilities
+├── .gitignore            # Ignores reports/, experiments/**/reports/, .venv/, etc.
 ├── pyproject.toml        # Dependencies (uv)
 ├── uv.lock
-├── skills-lock.json      # Locks vectorbt-expert AI skill
-├── README.md
-├── QUICKSTART.md
-└── PROJECT_STRUCTURE.md
+└── skills-lock.json      # Locks vectorbt-expert AI skill
 ```
 
 ---
@@ -238,33 +243,84 @@ if __name__ == '__main__':
 ```python
 import sys
 from pathlib import Path
+from datetime import datetime
 project_root = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(project_root))
 
+import numpy as np
+import pandas as pd
 import vectorbt as vbt
-from utils import load_data
+from utils import DataLoader
 from strategy import calculate_signals
 
+# --- Config ---
+SYMBOL = 'EURUSD'
+ACCOUNT_SIZE = 10_000       # real margin capital in USD
+LEVERAGE = 100              # 1:100 retail FX leverage
+RISK_PER_TRADE = 0.01       # 1% of account per trade
+PIP = 0.0001                # pip size (0.01 for JPY pairs)
+PIP_VALUE_PER_LOT = 10.0    # USD per pip per standard lot (EURUSD)
+STD_LOT = 100_000           # units per standard lot
+FX_FEES = 0.00007           # ~0.7 pip spread per side
+FREQ = '1h'
 
-df = load_data('EURUSD', start_date='2024-01-01', end_date='2024-12-31')
+# --- Load & resample ---
+loader = DataLoader()
+df_1m = loader.load_fx(SYMBOL, start_date='2024-01-01')
+df = loader.resample_ohlcv(df_1m, '1H')
 df = calculate_signals(df)
 close = df['close']
+
+# --- Risk-based lot sizing ---
+# Lot units sized so SL hit = RISK_PER_TRADE * ACCOUNT_SIZE
+# units = (account * risk) / (sl_pips * pip_value_per_lot)
+# Pass init_cash = ACCOUNT_SIZE * LEVERAGE (notional buying power)
+
+# --- Run backtest ---
+# IMPORTANT: vbt defaults to FigureWidget which requires anywidget.
+# Always set use_widgets=False before calling pf.plot() to save HTML.
+vbt.settings.plotting['use_widgets'] = False
 
 pf = vbt.Portfolio.from_signals(
     close,
     entries=df['buy_signal'],
     exits=df['sell_signal'],
-    init_cash=10_000,
-    fees=0.0001,   # 0.01% commission (typical FX spread)
-    freq='1T',     # 1-minute data
+    init_cash=ACCOUNT_SIZE * LEVERAGE,  # notional buying power
+    size=10_000,                        # units — replace with per-bar sizing
+    size_type='amount',
+    fees=FX_FEES,
+    sl_stop=0.003,                      # replace with per-bar sl_stop Series
+    tp_stop=0.006,                      # replace with per-bar tp_stop Series
+    freq=FREQ,
 )
 
-print(pf.stats())
+# Re-anchor stats to real margin capital
+abs_pnl = pf.value().iloc[-1] - (ACCOUNT_SIZE * LEVERAGE)
+return_on_margin = (abs_pnl / ACCOUNT_SIZE) * 100
 
-reports_dir = project_root / 'reports'
-reports_dir.mkdir(exist_ok=True)
-with open(reports_dir / 'my_strategy_backtest_report.txt', 'w') as f:
-    f.write(str(pf.stats()))
+stats = pf.stats()
+stats['Start Value'] = ACCOUNT_SIZE
+stats['End Value'] = ACCOUNT_SIZE + abs_pnl
+stats['Total Return [%]'] = return_on_margin
+
+print(stats)
+
+# --- Save outputs to timestamped run folder ---
+run_ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+reports_dir = Path(__file__).resolve().parent / 'reports' / f'{SYMBOL}_{run_ts}'
+reports_dir.mkdir(parents=True, exist_ok=True)
+
+with open(reports_dir / 'backtest_report.txt', 'w') as f:
+    f.write(str(stats))
+
+pf.trades.records_readable.to_csv(reports_dir / 'trades.csv')
+
+vbt_fig = pf.plot(subplots=['value', 'cum_returns', 'underwater', 'drawdowns', 'orders', 'trades', 'net_exposure'])
+vbt_fig.write_html(str(reports_dir / 'vbt_report.html'))
+
+pf.save(str(reports_dir / 'portfolio.pkl'))
+
+print(f'Outputs saved -> {reports_dir}')
 ```
 
 ---
