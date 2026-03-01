@@ -27,9 +27,17 @@ sys.path.insert(0, str(project_root))
 import numpy as np
 import pandas as pd
 import vectorbt as vbt
+import mlflow
 
 from utils import load_data
 from strategy import calculate_signals
+
+# ---------------------------------------------------------------------------
+# MLflow — point at the local server
+# ---------------------------------------------------------------------------
+MLFLOW_TRACKING_URI = "http://localhost:5000"
+mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+mlflow.set_experiment("silver-bullet-optimization")
 
 # ---------------------------------------------------------------------------
 # Config
@@ -97,6 +105,25 @@ df_raw = load_data(
     SYMBOL, asset_type=ASSET_TYPE, start_date=START_DATE, end_date=END_DATE
 )
 print(f"  {len(df_raw):,} rows  [{df_raw.index.min()} -> {df_raw.index.max()}]")
+
+mlflow_run = mlflow.start_run(run_name=f"optimize_{SYMBOL}_{START_DATE}_{END_DATE}")
+mlflow.log_params(
+    {
+        "symbol": SYMBOL,
+        "asset_type": ASSET_TYPE,
+        "start_date": START_DATE,
+        "end_date": END_DATE,
+        "init_cash": INIT_CASH,
+        "leverage": LEVERAGE,
+        "lot_size": LOT_SIZE,
+        "fees": FEES,
+        "min_trades": MIN_TRADES,
+        "top_n_phase1": TOP_N_PHASE1,
+        "phase1_combinations": len(
+            list(itertools.product(*[PHASE1_GRID[k] for k in PHASE1_GRID]))
+        ),
+    }
+)
 
 
 # ---------------------------------------------------------------------------
@@ -576,6 +603,48 @@ full_html = f"""<!DOCTYPE html>
 output_path = reports_dir / "silver_bullet_optimization_report.html"
 with open(output_path, "w", encoding="utf-8") as f:
     f.write(full_html)
+
+# ---------------------------------------------------------------------------
+# MLflow — log best result metrics + all artifacts
+# ---------------------------------------------------------------------------
+if len(final_sorted) > 0:
+    b = final_sorted.iloc[0]
+    mlflow.log_metrics(
+        {
+            "best_sharpe": float(b["sharpe"]),
+            "best_return_on_margin_pct": float(b["total_return_pct"]),
+            "best_win_rate_pct": float(b["win_rate"]),
+            "best_max_drawdown_pct": float(b["max_drawdown_pct"]),
+            "best_profit_factor": float(b["profit_factor"])
+            if pd.notna(b["profit_factor"])
+            else 0.0,
+            "best_trades": float(b["trades"]),
+            "phase1_valid_runs": float(len(df_p1_valid)),
+            "phase1_total_runs": float(len(df_phase1)),
+        }
+    )
+    mlflow.log_params(
+        {
+            "best_rr_ratio": float(b["rr_ratio"]),
+            "best_liquidity_window": int(b["liquidity_window"]),
+            "best_sl_buffer_pts": float(b["sl_buffer_pts"]),
+            "best_session_cap_usd": float(b["session_cap_usd"]),
+            "best_sweep_lookback": int(b["sweep_lookback"]),
+            "best_pullback_window": int(b["pullback_window"]),
+        }
+    )
+
+mlflow.log_artifact(
+    str(reports_dir / "silver_bullet_optimization_phase1.csv"), artifact_path="results"
+)
+if (reports_dir / "silver_bullet_optimization_phase2.csv").exists():
+    mlflow.log_artifact(
+        str(reports_dir / "silver_bullet_optimization_phase2.csv"),
+        artifact_path="results",
+    )
+mlflow.log_artifact(str(output_path), artifact_path="reports")
+mlflow.end_run()
+print(f"\n  MLflow run logged -> {MLFLOW_TRACKING_URI}")
 
 print(f"\nReport saved -> {output_path}")
 print("\nOptimisation complete.")

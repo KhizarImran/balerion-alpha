@@ -20,10 +20,15 @@ Outputs saved to experiments/Unicorn-ICT/reports/{SYMBOL}_{YYYYMMDD_HHMMSS}/:
 """
 
 import sys
+import io
 from pathlib import Path
 
 project_root = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(project_root))
+
+# Fix Windows cp1252 terminal encoding so MLflow's emoji output doesn't crash
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 import numpy as np
 import pandas as pd
@@ -31,8 +36,20 @@ import vectorbt as vbt
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime
+import mlflow
 
 from utils import DataLoader
+
+# ---------------------------------------------------------------------------
+# MLflow — point at the local server
+# ---------------------------------------------------------------------------
+import os
+
+os.environ["MLFLOW_ENABLE_PROXY_MLFLOW_ARTIFACTS"] = "true"
+
+MLFLOW_TRACKING_URI = "http://localhost:5000"
+mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+mlflow.set_experiment("unicorn-ict")
 
 # Import signal logic from strategy.py in the same folder
 import importlib.util
@@ -369,11 +386,47 @@ def run_backtest(
     print("=" * 60)
 
     # ------------------------------------------------------------------
-    # 6. Save outputs
+    # 6. Save outputs + MLflow logging
     # ------------------------------------------------------------------
     run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     reports_dir = Path(__file__).resolve().parent / "reports" / f"{symbol}_{run_ts}"
     reports_dir.mkdir(parents=True, exist_ok=True)
+
+    # Start MLflow run (ended after all artifacts are saved below)
+    mlflow.start_run(run_name=f"{symbol}_1H_{start_date}_{end_date}")
+    mlflow.log_params(
+        {
+            "symbol": symbol,
+            "asset_type": ASSET_TYPE,
+            "start_date": start_date,
+            "end_date": end_date,
+            "account_size": account_size,
+            "leverage": leverage,
+            "risk_per_trade": risk_per_trade,
+            "min_rr": min_rr,
+            "sl_buffer": sl_buffer,
+            "fx_fees": FX_FEES,
+            "freq": FREQ,
+        }
+    )
+    mlflow.log_metrics(
+        {
+            "abs_pnl": float(abs_pnl),
+            "return_on_margin_pct": float(return_on_margin),
+            "sharpe_ratio": float(pf.sharpe_ratio()),
+            "sortino_ratio": float(pf.sortino_ratio()),
+            "max_drawdown_pct": float(pf.max_drawdown() * 100),
+            "total_trades": float(pf.trades.count()),
+            "win_rate_pct": float(pf.trades.win_rate() * 100)
+            if pf.trades.count() > 0
+            else 0.0,
+            "profit_factor": float(pf.trades.profit_factor())
+            if pf.trades.count() > 0
+            else 0.0,
+            "n_long_entries": float(n_long),
+            "n_short_entries": float(n_short),
+        }
+    )
 
     if save_outputs:
         # Text report
@@ -555,6 +608,12 @@ def run_backtest(
         fig.write_html(str(chart_path))
         print(f"  Equity chart   -> {chart_path}")
         print(f"\n  All outputs in -> {reports_dir}")
+
+        # Upload the entire run folder to MLflow as a single artifact directory
+        mlflow.log_artifacts(str(reports_dir), artifact_path="outputs")
+
+    mlflow.end_run()
+    print(f"  MLflow run logged -> {MLFLOW_TRACKING_URI}")
 
     if show_chart:
         fig.show()

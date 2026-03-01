@@ -22,9 +22,17 @@ import numpy as np
 import vectorbt as vbt
 from plotly.subplots import make_subplots
 import plotly.graph_objects as go
+import mlflow
 
 from utils import load_data
 from strategy import calculate_signals
+
+# ---------------------------------------------------------------------------
+# MLflow — point at the local server
+# ---------------------------------------------------------------------------
+MLFLOW_TRACKING_URI = "http://localhost:5000"
+mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+mlflow.set_experiment("silver-bullet")
 
 # ---------------------------------------------------------------------------
 # Config
@@ -105,6 +113,8 @@ close = df["close"]
 # ---------------------------------------------------------------------------
 
 print("\nRunning backtest...")
+mlflow_run = mlflow.start_run(run_name=f"{SYMBOL}_{START_DATE}_{END_DATE}")
+
 pf = vbt.Portfolio.from_signals(
     close=close,
     entries=entries,
@@ -133,6 +143,49 @@ print(
 print(f"  Win Rate           : {stats['Win Rate [%]']:.1f}%")
 print(f"  Sharpe Ratio       : {stats['Sharpe Ratio']:.2f}")
 print(f"  Max Drawdown       : {stats['Max Drawdown [%]']:.2f}%")
+
+# ---------------------------------------------------------------------------
+# MLflow — log parameters and metrics
+# ---------------------------------------------------------------------------
+
+mlflow.log_params(
+    {
+        "symbol": SYMBOL,
+        "asset_type": ASSET_TYPE,
+        "start_date": START_DATE,
+        "end_date": END_DATE,
+        "init_cash": INIT_CASH,
+        "leverage": LEVERAGE,
+        "lot_size": LOT_SIZE,
+        "fees": FEES,
+        "rr_ratio": RR_RATIO,
+        "sl_buffer": SL_BUFFER,
+        "session_cap": SESSION_CAP,
+        "liquidity_window": LIQUIDITY_WINDOW,
+        "sweep_lookback": SWEEP_LOOKBACK,
+        "pullback_window": PULLBACK_WINDOW,
+    }
+)
+
+mlflow.log_metrics(
+    {
+        "abs_pnl": float(abs_pnl),
+        "return_on_margin_pct": float(return_on_margin),
+        "sharpe_ratio": float(stats["Sharpe Ratio"]),
+        "sortino_ratio": float(stats["Sortino Ratio"]),
+        "win_rate_pct": float(stats["Win Rate [%]"]),
+        "max_drawdown_pct": float(stats["Max Drawdown [%]"]),
+        "total_trades": float(stats["Total Trades"]),
+        "profit_factor": float(stats.get("Profit Factor", float("nan"))),
+        "best_trade_pct": float(stats["Best Trade [%]"]),
+        "worst_trade_pct": float(stats["Worst Trade [%]"]),
+        "avg_winning_trade_pct": float(stats["Avg Winning Trade [%]"]),
+        "avg_losing_trade_pct": float(stats["Avg Losing Trade [%]"]),
+        "expectancy": float(stats.get("Expectancy", float("nan"))),
+        "total_fees_paid": float(stats["Total Fees Paid"]),
+        "entry_signals": float(entries.sum()),
+    }
+)
 
 # ---------------------------------------------------------------------------
 # Build combined 6-chart Plotly figure
@@ -725,6 +778,11 @@ with open(output_file, "w", encoding="utf-8") as f:
     f.write(full_html)
 
 file_size_mb = os.path.getsize(output_file) / 1024 / 1024
+
+# MLflow — log the HTML report as an artifact and close the run
+mlflow.log_artifact(str(output_file), artifact_path="reports")
+mlflow.end_run()
+print(f"\n  MLflow run logged -> {MLFLOW_TRACKING_URI}")
 
 print("\n" + "=" * 70)
 print("BACKTEST REPORT COMPLETE")

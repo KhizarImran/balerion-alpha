@@ -4,7 +4,7 @@ Research and backtesting layer for the Balerion quantitative hedge fund.
 
 ## Overview
 
-This repository contains strategy research, experimentation, and backtesting for the Balerion quant fund. It works in conjunction with the data layer (`balerion-data`) to analyze market data and develop trading strategies.
+This repository contains strategy research, signal generation, and backtesting for the Balerion quant fund. It works in conjunction with the data layer (`balerion-data`) for market data and pushes all experiment results to a self-hosted MLflow server for tracking, comparison, and artifact storage.
 
 ## Architecture
 
@@ -12,27 +12,29 @@ This repository contains strategy research, experimentation, and backtesting for
 ┌─────────────────────────────────────────────┐
 │         balerion-data (Layer 1)             │
 │  - MT5 data collection                      │
-│  - Parquet storage (OHLCV)                  │
+│  - Parquet storage (OHLCV, 1-minute)        │
 │  - FX pairs + indices                       │
 └─────────────────┬───────────────────────────┘
-                  │
                   │ Data Loading
                   ▼
 ┌─────────────────────────────────────────────┐
 │       balerion-alpha (Layer 2)              │
 │                                             │
 │  ┌──────────────┐  ┌──────────────┐        │
-│  │ Experiments  │  │ Backtesting  │        │
-│  │ - Standalone │  │ - vectorbt   │        │
-│  │   scripts    │  │ - Metrics    │        │
-│  │ - Plotly viz │  │ - Analysis   │        │
-│  └──────────────┘  └──────────────┘        │
-│                                             │
-│  ┌──────────────────────────────┐          │
-│  │ Utils                        │          │
-│  │ - Data loader                │          │
-│  │ - Plotting                   │          │
-│  └──────────────────────────────┘          │
+│  │ Experiments  │  │  Backtests   │        │
+│  │ - Strategies │  │ - vectorbt   │        │
+│  │ - Signals    │  │ - Metrics    │        │
+│  │ - Plotly viz │  │ - Artifacts  │        │
+│  └──────────────┘  └──────┬───────┘        │
+│                            │                │
+└────────────────────────────┼────────────────┘
+                             │ MLflow logging
+                             ▼
+┌─────────────────────────────────────────────┐
+│       mlflow-server (../mlflow-server/)     │
+│  - Docker container, port 5000              │
+│  - SQLite backend + artifact proxy          │
+│  - UI: http://localhost:5000                │
 └─────────────────────────────────────────────┘
 ```
 
@@ -40,270 +42,116 @@ This repository contains strategy research, experimentation, and backtesting for
 
 ```
 balerion-alpha/
-├── experiments/           # Strategy experiments (standalone scripts)
-│   └── sma_crossover/     # Example: SMA crossover strategy
-│       ├── strategy.py    # Strategy logic + visualization
-│       ├── backtest.py    # Backtesting script (optional)
-│       └── README.md      # Strategy documentation
-│
-├── reports/               # All generated reports (charts + backtest results)
-│   ├── sma_crossover_EURUSD_20_50.html
-│   ├── sma_crossover_backtest_report.txt
-│   └── README.md
-│
-├── utils/                 # Shared utilities
-│   ├── data_loader.py     # Load data from balerion-data
-│   ├── plotting.py        # Plotly visualization utilities
+├── experiments/
+│   ├── silver-bullet/        # ICT Silver Bullet (US30, 1-minute)
+│   │   ├── strategy.py       # Signal generation
+│   │   ├── backtest.py       # Backtest → MLflow experiment: silver-bullet
+│   │   └── optimize.py       # Optimization → MLflow experiment: silver-bullet-optimization
+│   └── Unicorn-ICT/          # ICT Unicorn Model (EURUSD, 1H)
+│       ├── strategy.py       # Signal generation
+│       └── backtest.py       # Backtest → MLflow experiment: unicorn-ict
+├── utils/
+│   ├── data_loader.py        # Load data from balerion-data
+│   ├── plotting.py           # Plotly visualization utilities
 │   └── __init__.py
-│
-├── config/                # Configuration files
-├── notebooks/             # Jupyter notebooks for analysis
-├── tests/                 # Unit tests
-│
-├── pyproject.toml         # Project configuration (uv)
-└── README.md              # This file
+├── reports/                  # Generated outputs (gitignored)
+├── src/balerion_alpha/       # Package scaffold stub
+├── tests/
+├── pyproject.toml            # Dependencies (uv)
+└── README.md
 ```
 
-## Installation
+## Prerequisites
 
-### Prerequisites
 - Python 3.11+
-- uv package manager
-- balerion-data repository set up in `../balerion-data/`
+- [uv](https://astral.sh/uv) package manager
+- `../balerion-data/` repository set up as a sibling directory
+- `../mlflow-server/` running (Docker)
 
-### Setup
+## Setup
 
-```bash
-# Install uv (if not already installed)
-# Windows
+```powershell
+# Install uv (Windows)
 irm https://astral.sh/uv/install.ps1 | iex
-
-# Linux/Mac
-curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # Install dependencies
 cd balerion-alpha
 uv sync
 ```
 
-## Quick Start
+## MLflow Server
 
-### 1. Load Data
+All backtest runs are tracked in MLflow. The server lives in the sibling `mlflow-server/` directory and runs as a Docker container.
 
-```python
-from utils import load_data
+```powershell
+# Start the server (run once, stays up)
+cd ../mlflow-server
+docker compose up -d
 
-# Load FX data
-df = load_data('EURUSD', asset_type='fx', start_date='2024-01-01')
+# Open the UI
+# http://localhost:5000
 
-# Load index data
-df = load_data('US30', asset_type='indices', start_date='2024-01-01')
-
-# Resample to higher timeframe
-df_hourly = df.resample('1H').agg({
-    'open': 'first',
-    'high': 'max',
-    'low': 'min',
-    'close': 'last',
-    'volume': 'sum'
-}).dropna()
+# Stop the server
+docker compose down
 ```
 
-### 2. Run an Experiment
+**The MLflow server must be running before executing any backtest script.**
 
-Experiments are standalone scripts that calculate signals and visualize them on candlestick charts.
+### Experiments
 
-```bash
-# Run the SMA crossover example
-cd experiments/sma_crossover
-uv run python strategy.py
+| MLflow Experiment | Script |
+|---|---|
+| `unicorn-ict` | `experiments/Unicorn-ICT/backtest.py` |
+| `silver-bullet` | `experiments/silver-bullet/backtest.py` |
+| `silver-bullet-optimization` | `experiments/silver-bullet/optimize.py` |
+
+### What gets tracked per run
+
+- **Params**: symbol, date range, account size, leverage, risk settings, all strategy parameters
+- **Metrics**: Sharpe ratio, Sortino ratio, return on margin %, win rate %, max drawdown %, profit factor, total trades, absolute P&L
+- **Artifacts**: `outputs/` folder containing equity HTML chart, VBT report HTML, trades CSV, backtest report TXT, portfolio PKL
+
+## Running Backtests
+
+```powershell
+# Unicorn ICT — EURUSD 1H
+uv run python experiments/Unicorn-ICT/backtest.py
+
+# Silver Bullet — US30 1-minute
+uv run python experiments/silver-bullet/backtest.py
+
+# Silver Bullet — parameter optimization (long-running)
+uv run python experiments/silver-bullet/optimize.py
 ```
 
-This will:
-- Load data from balerion-data
-- Calculate SMA crossover signals
-- Generate an interactive Plotly chart with buy/sell markers
-- Save the chart to `reports/` folder
-
-### 3. Backtest a Strategy
-
-Each experiment can have its own `backtest.py` script that uses vectorbt.
-Create your own backtesting script within the experiment folder (see example structure below).
-
-### 4. Create a New Experiment
-
-```bash
-# Create new experiment folder
-mkdir experiments/my_strategy
-cd experiments/my_strategy
-
-# Create strategy.py and optionally backtest.py
-```
-
-Each experiment folder should contain:
-- `strategy.py` - Signal generation and visualization
-- `backtest.py` - Backtesting script (optional, you create as needed)
-- `README.md` - Strategy documentation
-
-All outputs (charts, reports) are saved to the `/reports/` directory.
-
-**Template for `strategy.py`:**
-
-```python
-import sys
-from pathlib import Path
-project_root = Path(__file__).resolve().parent.parent.parent
-sys.path.insert(0, str(project_root))
-
-import pandas as pd
-from utils import load_data, plot_candlestick_with_signals
-
-
-def calculate_signals(df: pd.DataFrame, **params) -> pd.DataFrame:
-    """Calculate your strategy signals."""
-    df = df.copy()
-    
-    # Your strategy logic here
-    df['indicator'] = df['close'].rolling(20).mean()
-    df['buy_signal'] = df['close'] > df['indicator']
-    df['sell_signal'] = df['close'] < df['indicator']
-    
-    return df
-
-
-def run_experiment(symbol='EURUSD', **params):
-    """Run the experiment and visualize."""
-    df = load_data(symbol, start_date='2024-01-01')
-    df = calculate_signals(df, **params)
-    
-    fig = plot_candlestick_with_signals(
-        df,
-        title=f'{symbol} - My Strategy',
-        buy_signals=df['buy_signal'],
-        sell_signals=df['sell_signal'],
-        indicators={'Indicator': df['indicator']}
-    )
-    
-    # Save to reports directory
-    reports_dir = project_root / "reports"
-    reports_dir.mkdir(exist_ok=True)
-    output_file = reports_dir / f"my_strategy_{symbol}.html"
-    fig.write_html(str(output_file))
-    print(f"Chart saved to: {output_file}")
-    
-    fig.show()
-    return df, fig
-
-
-if __name__ == '__main__':
-    df, fig = run_experiment()
-```
-
-## Visualization
-
-The project uses Plotly for interactive charts:
-
-```python
-from utils import plot_candlestick_with_signals
-
-# Plot with signals
-fig = plot_candlestick_with_signals(
-    df,
-    title='My Strategy',
-    buy_signals=df['buy_signal'],
-    sell_signals=df['sell_signal'],
-    indicators={
-        'SMA 20': df['sma_20'],
-        'SMA 50': df['sma_50']
-    },
-    show_volume=True
-)
-
-# Show in browser
-fig.show()
-
-# Save to file
-fig.write_html('my_strategy.html')
-```
-
-## Backtesting with vectorbt
-
-Create a `backtest.py` file in your experiment folder:
-
-```python
-import sys
-from pathlib import Path
-project_root = Path(__file__).resolve().parent.parent.parent
-sys.path.insert(0, str(project_root))
-
-import vectorbt as vbt
-from utils import load_data
-from strategy import calculate_signals
-
-# Load data and calculate signals
-df = load_data('EURUSD', start_date='2024-01-01', end_date='2024-12-31')
-df = calculate_signals(df)
-
-# Run backtest
-portfolio = vbt.Portfolio.from_signals(
-    close=df['close'],
-    entries=df['buy_signal'],
-    exits=df['sell_signal'],
-    init_cash=10000.0,
-    fees=0.0001,  # 0.01% commission
-    freq='1T'
-)
-
-# Print metrics
-print(portfolio.stats())
-
-# Save report to reports/
-reports_dir = project_root / "reports"
-reports_dir.mkdir(exist_ok=True)
-with open(reports_dir / "my_strategy_backtest_report.txt", 'w') as f:
-    f.write(str(portfolio.stats()))
-```
-
-### Key Metrics Calculated
-- Total Return %
-- Sharpe Ratio
-- Max Drawdown
-- Win Rate
-- Average Win/Loss
-- Total Trades
-- Best/Worst Trade
+Results are viewable immediately at `http://localhost:5000`.
 
 ## Available Data
 
-### FX Pairs (from balerion-data)
-- EURUSD, USDJPY, GBPUSD, EURGBP, USDCAD, AUDNZD
+| Asset Class | Symbols | Native Timeframe |
+|---|---|---|
+| FX Pairs | EURUSD, USDJPY, GBPUSD, EURGBP, USDCAD, AUDNZD | 1 minute |
+| Indices | US30 (Dow Jones), XAUUSD (Gold) | 1 minute |
 
-### Indices
-- US30 (Dow Jones), XAUUSD (Gold)
+Resample to any higher timeframe via `DataLoader.resample_ohlcv(df, '1H')`.
 
-### Timeframe
-- Native: 1 minute
-- Resample to any timeframe (5m, 15m, 1H, 4H, 1D, etc.)
+## Adding a New Experiment
 
-## Dependencies
+1. Create `experiments/my_strategy/` with `strategy.py` and `backtest.py`
+2. Add MLflow tracking to `backtest.py` (see `CLAUDE.md` for the template)
+3. Set the experiment name with `mlflow.set_experiment("my-strategy")`
+4. Run — the experiment appears automatically in the MLflow UI
 
-Core packages:
-- `vectorbt` - Backtesting engine
-- `pandas` - Data manipulation
-- `plotly` - Interactive charts
-- `pyarrow` - Parquet file reading
+## Key Dependencies
 
-Development packages:
-- `pytest`, `black`, `ruff`
-
-## Tips
-
-- **Start simple**: Begin with basic strategies (moving averages, momentum)
-- **Visualize first**: Always plot signals before backtesting
-- **Use notebooks**: Great for exploration and iteration
-- **Test multiple timeframes**: Strategies perform differently on different timeframes
-- **Parameter optimization**: Use loops to test different parameter combinations
+| Package | Purpose |
+|---|---|
+| `vectorbt` | Backtesting engine |
+| `mlflow` | Experiment tracking + artifact storage |
+| `pandas` / `pyarrow` | Data manipulation + Parquet I/O |
+| `plotly` | Interactive HTML charts |
+| `numpy` / `scipy` | Numerical computing |
 
 ## License
 
-Private - All rights reserved.
+Private — All rights reserved.
