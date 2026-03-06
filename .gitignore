@@ -51,6 +51,9 @@ experiments/**/reports/
 # Logs
 *.log
 
+# Environment / secrets
+.env
+
 # Misc
 .cache/
 *.bak
