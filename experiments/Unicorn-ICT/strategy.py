@@ -1,28 +1,52 @@
 """
-ICT Unicorn Model — Strategy Visualization
+ICT Unicorn Model — Strategy (Breaker Block + FVG Overlap)
 
-Full Unicorn setup detection logic:
+CORRECT SEQUENCE — BEARISH SETUP (sell)
+========================================
 
-  BEARISH UNICORN (sell)
-  ----------------------
-  1. A confirmed swing high exists (left-side pivot, N bars of lower highs on each side).
-  2. Price prints a HIGHER HIGH — takes out that swing high (manipulation sweep up).
-  3. Within the next `choch_window` bars, price breaks BELOW the most recent confirmed
-     swing low — this is the Change of Character (CHoCH), confirming a trend shift down.
-  4. A bearish FVG formed during the displacement move that broke the swing low is
-     recorded as the entry zone.
-  5. On any subsequent bar, if price retraces INTO that bearish FVG (high >= fvg_bot)
-     a SELL signal fires.  The FVG is then consumed (one signal per setup).
+Step 1 — Swing High confirmed
+  A pivot high forms: bar i is the highest high across (pivot_left + pivot_right + 1) bars.
+  Confirmed at bar i+pivot_right (we wait for the right-side bars to close).
 
-  BULLISH UNICORN (buy) — exact mirror
-  -------------------------------------
-  1. Confirmed swing low exists.
-  2. Price prints a LOWER LOW — takes out that swing low (sweep down).
-  3. Within `choch_window` bars, price breaks ABOVE the most recent confirmed swing high.
-  4. A bullish FVG formed during the displacement up is recorded.
-  5. Price retraces INTO the bullish FVG (low <= fvg_top) → BUY signal.
+Step 2 — Order Block identified
+  The last bullish candle (close > open) in the pivot_left bars LEADING INTO the
+  pivot high bar. This is the candle that made the final push up — the "last up-close
+  before the top". Its full range (high → low) is the raw Order Block zone.
 
-All detection is strictly left-looking (no lookahead bias).
+Step 3 — Displacement FVG
+  After the swing high, price drops. We look for a BEARISH FVG that forms on or after
+  the swing high bar during the sell-off. A bearish FVG at bar j means:
+      low[j-2] > high[j]   — a downward gap exists between candle j-2 and candle j
+  The FVG zone: top = low[j-2],  bot = high[j]   (price is ABOVE this gap now)
+
+Step 4 — Structure break confirms the Breaker
+  The Order Block becomes a Breaker Block when price CLOSES BELOW the swing low
+  that existed immediately before the swing high (i.e. the prior confirmed pivot low).
+  This is the CHoCH — Change of Character.
+
+Step 5 — Overlap = Entry Zone
+  IF the displacement FVG (step 3) overlaps with the OB zone (step 2), the overlap
+  is the Unicorn entry zone.
+
+Step 6 — Entry signal
+  Price retraces UP into the overlap zone (wick or close touches the bottom edge).
+  → SELL signal. SL above the OB high. TP = 2R below entry.
+
+
+CORRECT SEQUENCE — BULLISH SETUP (buy) — exact mirror
+======================================================
+
+Step 1 — Swing Low confirmed
+Step 2 — Last BEARISH candle before the pivot low = Order Block
+Step 3 — Bullish FVG forms on or after the swing low during the rally:
+          high[j-2] < low[j]   — upward gap
+          FVG zone: top = low[j],  bot = high[j-2]
+Step 4 — Price closes ABOVE the swing high that existed before the swing low
+Step 5 — FVG overlaps OB zone → overlap zone armed
+Step 6 — Price retraces DOWN into the overlap zone → BUY signal
+
+
+No lookahead bias. All pivots are confirmed with a right-side shift.
 """
 
 import sys
@@ -40,353 +64,456 @@ from utils import DataLoader
 
 
 # ---------------------------------------------------------------------------
-# Pivot swing high / swing low  (left-side only — no lookahead)
+# Configuration
 # ---------------------------------------------------------------------------
 
+PIVOT_LEFT  = 5   # bars to the left of pivot
+PIVOT_RIGHT = 5   # bars to the right (confirmation lag)
+ZONE_TIMEOUT = 50 # bars an armed zone stays valid
 
-def calculate_pivots(df: pd.DataFrame, left: int = 3, right: int = 3) -> pd.DataFrame:
+
+# ---------------------------------------------------------------------------
+# Step 1 helper: compute confirmed pivot highs and lows
+# ---------------------------------------------------------------------------
+
+def _compute_pivots(df: pd.DataFrame, left: int, right: int) -> tuple[np.ndarray, np.ndarray]:
     """
-    Detect pivot swing highs and swing lows using a left+right bar window.
-
-    A pivot high at bar i requires:
-        df['high'][i] == max(df['high'][i-left : i+right+1])
-    A pivot low at bar i requires:
-        df['low'][i]  == min(df['low'][i-left  : i+right+1])
-
-    Because we use center=True rolling this introduces a right-side look of
-    `right` bars — we shift the result forward by `right` bars so that the
-    pivot is only *confirmed* once the right-side bars have closed.
-    This avoids lookahead: the pivot at bar i is known at bar i+right.
-
-    Adds columns:
-        pivot_high : float — confirmed pivot high price (NaN elsewhere)
-        pivot_low  : float — confirmed pivot low price  (NaN elsewhere)
+    Return arrays pivot_high and pivot_low.
+    pivot_high[i] = the pivot high price confirmed at bar i (NaN if bar i is not a confirmation bar).
+    The actual peak occurred at bar i - right (the center of the window), but we only
+    mark it as confirmed once the right-side bars have closed — hence the shift(right).
     """
-    df = df.copy()
     n = left + right + 1
-
     roll_max = df["high"].rolling(window=n, center=True).max()
     roll_min = df["low"].rolling(window=n, center=True).min()
-
-    raw_ph = np.where(df["high"] == roll_max, df["high"], np.nan)
-    raw_pl = np.where(df["low"] == roll_min, df["low"], np.nan)
-
-    # Shift forward by `right` so the signal only appears after right-side bars close
-    df["pivot_high"] = pd.Series(raw_ph, index=df.index).shift(right)
-    df["pivot_low"] = pd.Series(raw_pl, index=df.index).shift(right)
-
-    return df
+    h_vals = df["high"].to_numpy(dtype=float)
+    l_vals = df["low"].to_numpy(dtype=float)
+    raw_ph = np.where(h_vals == roll_max.to_numpy(dtype=float), h_vals, np.nan)
+    raw_pl = np.where(l_vals == roll_min.to_numpy(dtype=float), l_vals, np.nan)
+    ph: np.ndarray = pd.Series(raw_ph, index=df.index).shift(right).to_numpy()  # type: ignore[assignment]
+    pl: np.ndarray = pd.Series(raw_pl, index=df.index).shift(right).to_numpy()  # type: ignore[assignment]
+    return ph, pl
 
 
 # ---------------------------------------------------------------------------
-# FVG detection
+# Step 3 helper: find the first bearish/bullish FVG from a start bar onward
 # ---------------------------------------------------------------------------
 
-
-def calculate_fvg(df: pd.DataFrame) -> pd.DataFrame:
+def _find_bear_fvg_after(
+    highs: np.ndarray,
+    lows: np.ndarray,
+    start_bar: int,
+    end_bar: int,
+) -> tuple[float, float, int]:
     """
-    Detect all Fair Value Gaps.
-
-    Bullish FVG at bar i  : high[i-2] < low[i]   (gap between bar i-2 and bar i)
-    Bearish FVG at bar i  : low[i-2]  > high[i]
-
-    The FVG is attributed to bar i (the third candle), which is fully closed.
-    No lookahead.
-
-    Adds columns:
-        bull_fvg, bear_fvg            : bool
-        bull_fvg_top, bull_fvg_bot    : zone edges
-        bear_fvg_top, bear_fvg_bot    : zone edges
+    Scan bars [start_bar, end_bar] for the FIRST bearish FVG.
+    Bearish FVG at bar j: low[j-2] > high[j]
+    Returns (fvg_top, fvg_bot, bar_index) or (nan, nan, -1) if none found.
+    fvg_top = low[j-2],  fvg_bot = high[j]
     """
-    df = df.copy()
-    high = df["high"]
-    low = df["low"]
+    for j in range(max(start_bar, 2), end_bar + 1):
+        if lows[j - 2] > highs[j]:
+            return float(lows[j - 2]), float(highs[j]), j
+    return np.nan, np.nan, -1
 
-    bull = high.shift(2) < low
-    bear = low.shift(2) > high
 
-    df["bull_fvg"] = bull.fillna(False)
-    df["bear_fvg"] = bear.fillna(False)
-    df["bull_fvg_top"] = np.where(df["bull_fvg"], low, np.nan)
-    df["bull_fvg_bot"] = np.where(df["bull_fvg"], high.shift(2), np.nan)
-    df["bear_fvg_top"] = np.where(df["bear_fvg"], low.shift(2), np.nan)
-    df["bear_fvg_bot"] = np.where(df["bear_fvg"], high, np.nan)
-
-    return df
+def _find_bull_fvg_after(
+    highs: np.ndarray,
+    lows: np.ndarray,
+    start_bar: int,
+    end_bar: int,
+) -> tuple[float, float, int]:
+    """
+    Scan bars [start_bar, end_bar] for the FIRST bullish FVG.
+    Bullish FVG at bar j: high[j-2] < low[j]
+    Returns (fvg_top, fvg_bot, bar_index) or (nan, nan, -1) if none found.
+    fvg_top = low[j],  fvg_bot = high[j-2]
+    """
+    for j in range(max(start_bar, 2), end_bar + 1):
+        if highs[j - 2] < lows[j]:
+            return float(lows[j]), float(highs[j - 2]), j
+    return np.nan, np.nan, -1
 
 
 # ---------------------------------------------------------------------------
-# Unicorn setup state machine
+# Main detection: Breaker Block + FVG overlap
 # ---------------------------------------------------------------------------
 
-
-def detect_unicorn_setups(
+def detect_breaker_fvg_signals(
     df: pd.DataFrame,
-    choch_window: int = 10,
-    fvg_timeout: int = 20,
+    pivot_left: int = PIVOT_LEFT,
+    pivot_right: int = PIVOT_RIGHT,
+    zone_timeout: int = ZONE_TIMEOUT,
 ) -> pd.DataFrame:
     """
-    Bar-by-bar state machine that detects the full Unicorn sequence and
-    generates entry signals when price retraces into the setup FVG.
+    Full Unicorn detection: swing high/low → OB candidate → displacement FVG →
+    structure break (CHoCH) → overlap zone → retrace entry.
 
-    Parameters
-    ----------
-    df           : DataFrame with pivot_high, pivot_low, bull_fvg / bear_fvg cols
-    choch_window : Max bars allowed between the sweep and the CHoCH confirmation.
-                   If CHoCH doesn't happen within this window the setup resets to
-                   idle and the same bar is immediately re-evaluated for a new sweep.
-    fvg_timeout  : Max bars an armed FVG zone waits for price to retrace into it.
-                   If the retrace doesn't happen within this many bars the setup is
-                   invalidated, state returns to idle, and new setups are sought.
-
-    New columns added
-    -----------------
-    bear_sweep        : bool  — bar where a swing high was taken out (sweep up)
-    bear_choch        : bool  — bar where price broke below swing low (CHoCH down)
-    bear_fvg_armed    : bool  — a bearish Unicorn FVG is now active / waiting
-    bear_fvg_arm_top  : float — top of armed bearish FVG entry zone
-    bear_fvg_arm_bot  : float — bottom of armed bearish FVG entry zone
-    sell_signal       : bool  — price has tapped into the armed bearish FVG
-
-    bull_sweep        : bool
-    bull_choch        : bool
-    bull_fvg_armed    : bool
-    bull_fvg_arm_top  : float
-    bull_fvg_arm_bot  : float
-    buy_signal        : bool
+    See module docstring for the complete step-by-step logic.
     """
+    ph, pl = _compute_pivots(df, pivot_left, pivot_right)
+
     df = df.copy()
     n = len(df)
 
-    highs = df["high"].values
-    lows = df["low"].values
-    closes = df["close"].values
+    highs  = df["high"].values.astype(float)
+    lows   = df["low"].values.astype(float)
+    opens  = df["open"].values.astype(float)
+    closes = df["close"].values.astype(float)
 
-    ph = df["pivot_high"].values  # confirmed pivot highs (NaN if none)
-    pl = df["pivot_low"].values  # confirmed pivot lows  (NaN if none)
-
-    # FVG arrays
-    bull_fvg = df["bull_fvg"].values
-    bull_fvg_top = df["bull_fvg_top"].values
-    bull_fvg_bot = df["bull_fvg_bot"].values
-    bear_fvg = df["bear_fvg"].values
-    bear_fvg_top = df["bear_fvg_top"].values
-    bear_fvg_bot = df["bear_fvg_bot"].values
-
+    # -----------------------------------------------------------------------
     # Output arrays
-    bear_sweep_arr = np.zeros(n, dtype=bool)
-    bear_choch_arr = np.zeros(n, dtype=bool)
-    bear_fvg_armed_arr = np.zeros(n, dtype=bool)
-    bear_fvg_arm_top_arr = np.full(n, np.nan)
-    bear_fvg_arm_bot_arr = np.full(n, np.nan)
-    sell_signal_arr = np.zeros(n, dtype=bool)
-    sell_sl_price_arr = np.full(n, np.nan)  # SL price at sell signal bar
-    sell_tp_price_arr = np.full(n, np.nan)  # TP price at sell signal bar
+    # -----------------------------------------------------------------------
+    bear_breaker_arr     = np.zeros(n, dtype=bool)
+    bear_breaker_top_arr = np.full(n, np.nan)
+    bear_breaker_bot_arr = np.full(n, np.nan)
+    bear_breaker_ob_bar_arr = np.full(n, -1, dtype=int)  # positional index of the OB candle
+    bear_fvg_arr         = np.zeros(n, dtype=bool)
+    bear_fvg_top_arr     = np.full(n, np.nan)
+    bear_fvg_bot_arr     = np.full(n, np.nan)
 
-    bull_sweep_arr = np.zeros(n, dtype=bool)
-    bull_choch_arr = np.zeros(n, dtype=bool)
-    bull_fvg_armed_arr = np.zeros(n, dtype=bool)
-    bull_fvg_arm_top_arr = np.full(n, np.nan)
-    bull_fvg_arm_bot_arr = np.full(n, np.nan)
-    buy_signal_arr = np.zeros(n, dtype=bool)
-    buy_sl_price_arr = np.full(n, np.nan)  # SL price at buy signal bar
-    buy_tp_price_arr = np.full(n, np.nan)  # TP price at buy signal bar
+    bull_breaker_arr     = np.zeros(n, dtype=bool)
+    bull_breaker_top_arr = np.full(n, np.nan)
+    bull_breaker_bot_arr = np.full(n, np.nan)
+    bull_breaker_ob_bar_arr = np.full(n, -1, dtype=int)  # positional index of the OB candle
+    bull_fvg_arr         = np.zeros(n, dtype=bool)
+    bull_fvg_top_arr     = np.full(n, np.nan)
+    bull_fvg_bot_arr     = np.full(n, np.nan)
 
-    # ---- rolling pivot trackers ----
-    last_pivot_high = np.nan
-    last_pivot_low = np.nan
-    second_last_pivot_high = (
-        np.nan
-    )  # pivot high before the current last — used as TP for buys
-    second_last_pivot_low = (
-        np.nan
-    )  # pivot low  before the current last — used as TP for sells
+    sell_signal_arr   = np.zeros(n, dtype=bool)
+    sell_zone_top_arr = np.full(n, np.nan)
+    sell_zone_bot_arr = np.full(n, np.nan)
+    sell_sl_arr       = np.full(n, np.nan)
+    sell_tp_arr       = np.full(n, np.nan)
+    sell_fvg_bar_arr  = np.full(n, -1, dtype=int)   # FVG bar index for this signal
+    sell_ob_bar_arr   = np.full(n, -1, dtype=int)   # OB candle bar index for this signal
 
-    # Bear state machine variables
-    bear_state = "idle"  # idle | swept | armed
-    bear_choch_level = np.nan  # pivot low to break for CHoCH
-    bear_sweep_high = np.nan  # high of the sweep bar (SL goes above this)
-    bear_tp_level = np.nan  # prior pivot low — the liquidity target below
-    bear_sweep_bar = -1
-    bear_arm_bar = -1  # bar when armed (for fvg_timeout)
-    bear_fvg_top_val = np.nan
-    bear_fvg_bot_val = np.nan
+    buy_signal_arr   = np.zeros(n, dtype=bool)
+    buy_zone_top_arr = np.full(n, np.nan)
+    buy_zone_bot_arr = np.full(n, np.nan)
+    buy_sl_arr       = np.full(n, np.nan)
+    buy_tp_arr       = np.full(n, np.nan)
+    buy_fvg_bar_arr  = np.full(n, -1, dtype=int)    # FVG bar index for this signal
+    buy_ob_bar_arr   = np.full(n, -1, dtype=int)    # OB candle bar index for this signal
 
-    # Bull state machine variables
-    bull_state = "idle"
-    bull_choch_level = np.nan  # pivot high to break for CHoCH
-    bull_sweep_low = np.nan  # low of the sweep bar (SL goes below this)
-    bull_tp_level = np.nan  # prior pivot high — the liquidity target above
-    bull_sweep_bar = -1
-    bull_arm_bar = -1
-    bull_fvg_top_val = np.nan
-    bull_fvg_bot_val = np.nan
+    # -----------------------------------------------------------------------
+    # State trackers
+    #
+    # We process each confirmed pivot once. For each pivot high we:
+    #   a) find the OB candle (last bullish candle before the pivot)
+    #   b) record the prior pivot low as the CHoCH trigger level
+    #   c) scan forward from the pivot high bar for a displacement FVG
+    #   d) wait for price to close below the CHoCH level → breaker confirmed
+    #   e) check FVG vs OB overlap → arm entry zone
+    #   f) wait for price to retrace into overlap → signal
+    #
+    # We maintain a list of "pending" setups that are waiting for their
+    # CHoCH to fire, and a list of "armed" zones waiting for price entry.
+    # -----------------------------------------------------------------------
+
+    # pending_bear: list of dicts, each representing a setup waiting for CHoCH
+    #   keys: ob_high, ob_low, choch_level, pivot_bar, fvg_top, fvg_bot, fvg_bar
+    # (fvg fields may be nan if not yet found — we keep scanning)
+    pending_bear: list[dict] = []
+    pending_bull: list[dict] = []
+
+    # armed_bear / armed_bull: overlap zones waiting for price to retrace in
+    #   keys: zone_top, zone_bot, sl, bar
+    armed_bear: list[dict] = []
+    armed_bull: list[dict] = []
+
+    # Rolling tracker: most recent confirmed pivot low and pivot high prices
+    # These are updated as we encounter pivot confirmations.
+    last_conf_pivot_low  = np.nan  # the most recent confirmed pivot LOW price
+    last_conf_pivot_high = np.nan  # the most recent confirmed pivot HIGH price
 
     for i in range(n):
         h = highs[i]
         l = lows[i]
         c = closes[i]
 
-        # --- Update rolling pivot trackers ---
+        # -------------------------------------------------------------------
+        # A. Process any newly confirmed pivot HIGH at bar i
+        # -------------------------------------------------------------------
         if not np.isnan(ph[i]):
-            second_last_pivot_high = last_pivot_high
-            last_pivot_high = ph[i]
+            swing_high_price = ph[i]
+            # The actual peak bar is i - pivot_right (before the right-side confirmation)
+            peak_bar = i - pivot_right
+
+            # Step 2: Find last bullish candle in the pivot_left bars before the peak
+            ob_high, ob_low, ob_bar = np.nan, np.nan, -1
+            scan_start = max(peak_bar - pivot_left, 0)
+            for j in range(peak_bar - 1, scan_start - 1, -1):
+                if closes[j] > opens[j]:
+                    ob_high = highs[j]
+                    ob_low  = lows[j]
+                    ob_bar  = j
+                    break
+
+            if ob_bar < 0:
+                # No bullish candle found in the window — skip this pivot
+                last_conf_pivot_high = swing_high_price
+                continue
+
+            # CHoCH level: the most recent confirmed pivot LOW before this swing high
+            choch_level = last_conf_pivot_low  # price must close below this to confirm breaker
+
+            # Add to pending setups (FVG will be found as we scan forward)
+            pending_bear.append({
+                "ob_high":    ob_high,
+                "ob_low":     ob_low,
+                "ob_bar":     ob_bar,
+                "choch_level": choch_level,
+                "pivot_bar":  peak_bar,  # bar where the actual swing high peak sits
+                "swing_high": swing_high_price,
+                "fvg_top":    np.nan,
+                "fvg_bot":    np.nan,
+                "fvg_bar":    -1,
+                "armed_bar":  i,  # bar when this setup was registered
+            })
+
+            last_conf_pivot_high = swing_high_price
+
+        # -------------------------------------------------------------------
+        # B. Process any newly confirmed pivot LOW at bar i
+        # -------------------------------------------------------------------
         if not np.isnan(pl[i]):
-            second_last_pivot_low = last_pivot_low
-            last_pivot_low = pl[i]
+            swing_low_price = pl[i]
+            trough_bar = i - pivot_right
 
-        # ==================================================================
-        # BEARISH UNICORN STATE MACHINE
-        # ==================================================================
+            # Step 2: Find last bearish candle in the pivot_left bars before the trough
+            ob_high, ob_low, ob_bar = np.nan, np.nan, -1
+            scan_start = max(trough_bar - pivot_left, 0)
+            for j in range(trough_bar - 1, scan_start - 1, -1):
+                if closes[j] < opens[j]:
+                    ob_high = highs[j]
+                    ob_low  = lows[j]
+                    ob_bar  = j
+                    break
 
-        # Timeout in swept state: reset to idle then fall through to re-check
-        # this same bar for a new sweep (no `continue` — don't skip the bar).
-        if bear_state == "swept" and (i - bear_sweep_bar) > choch_window:
-            bear_state = "idle"
+            if ob_bar < 0:
+                last_conf_pivot_low = swing_low_price
+                continue
 
-        # Timeout in armed state: FVG not filled within fvg_timeout bars —
-        # invalidate and return to idle to look for a fresh setup.
-        if bear_state == "armed" and (i - bear_arm_bar) > fvg_timeout:
-            bear_state = "idle"
+            choch_level = last_conf_pivot_high  # price must close above this
 
-        if bear_state == "idle":
-            if not np.isnan(last_pivot_high) and not np.isnan(last_pivot_low):
-                if h > last_pivot_high:
-                    bear_state = "swept"
-                    bear_choch_level = last_pivot_low
-                    bear_sweep_high = h
-                    # TP: next liquidity pool below — the pivot low before the CHoCH level
-                    bear_tp_level = second_last_pivot_low
-                    bear_sweep_bar = i
-                    bear_sweep_arr[i] = True
+            pending_bull.append({
+                "ob_high":    ob_high,
+                "ob_low":     ob_low,
+                "ob_bar":     ob_bar,
+                "choch_level": choch_level,
+                "pivot_bar":  trough_bar,
+                "swing_low":  swing_low_price,
+                "fvg_top":    np.nan,
+                "fvg_bot":    np.nan,
+                "fvg_bar":    -1,
+                "armed_bar":  i,
+            })
 
-        elif bear_state == "swept":
-            # CHoCH: close breaks below the swing low that existed before the sweep
-            if c < bear_choch_level:
-                bear_choch_arr[i] = True
+            last_conf_pivot_low = swing_low_price
 
-                # Scan back for the nearest bearish FVG between sweep bar and now
-                found_fvg = False
-                for j in range(i, max(bear_sweep_bar - 1, -1), -1):
-                    if bear_fvg[j]:
-                        bear_fvg_top_val = bear_fvg_top[j]
-                        bear_fvg_bot_val = bear_fvg_bot[j]
-                        found_fvg = True
-                        break
+        # -------------------------------------------------------------------
+        # C. For each pending BEAR setup: try to find FVG and check CHoCH
+        # -------------------------------------------------------------------
+        still_pending_bear = []
+        for setup in pending_bear:
+            age = i - setup["armed_bar"]
 
-                if found_fvg:
-                    bear_state = "armed"
-                    bear_arm_bar = i
-                    bear_fvg_armed_arr[i] = True
-                    bear_fvg_arm_top_arr[i] = bear_fvg_top_val
-                    bear_fvg_arm_bot_arr[i] = bear_fvg_bot_val
-                else:
-                    bear_state = "idle"
+            # Expire if too old
+            if age > zone_timeout:
+                continue
 
-        elif bear_state == "armed":
-            bear_fvg_armed_arr[i] = True
-            bear_fvg_arm_top_arr[i] = bear_fvg_top_val
-            bear_fvg_arm_bot_arr[i] = bear_fvg_bot_val
-
-            # Entry: high retraces into the bearish FVG zone
-            if h >= bear_fvg_bot_val:
-                sell_signal_arr[i] = True
-                # SL: above the sweep high; TP: prior pivot low (next liquidity target)
-                sell_sl_price_arr[i] = bear_sweep_high
-                sell_tp_price_arr[i] = (
-                    bear_tp_level if not np.isnan(bear_tp_level) else bear_choch_level
+            # Try to find a bearish FVG if we haven't yet
+            # Search from the bar AFTER the swing high peak
+            if np.isnan(setup["fvg_top"]):
+                fvg_start = setup["pivot_bar"] + 1
+                fvg_top, fvg_bot, fvg_bar = _find_bear_fvg_after(
+                    highs, lows, fvg_start, i
                 )
-                bear_state = "idle"
-            # Invalidate: price closes above the FVG top (zone fully violated)
-            elif c > bear_fvg_top_val:
-                bear_state = "idle"
-            # Invalidate: price closes above the FVG top (zone fully violated)
-            elif c > bear_fvg_top_val:
-                bear_state = "idle"
+                if fvg_bar >= 0:
+                    setup["fvg_top"] = fvg_top
+                    setup["fvg_bot"] = fvg_bot
+                    setup["fvg_bar"] = fvg_bar
+                    # Mark this FVG on the output arrays for visualisation
+                    bear_fvg_arr[fvg_bar]     = True
+                    bear_fvg_top_arr[fvg_bar] = fvg_top
+                    bear_fvg_bot_arr[fvg_bar] = fvg_bot
 
-        # ==================================================================
-        # BULLISH UNICORN STATE MACHINE (mirror)
-        # ==================================================================
+            # Check CHoCH: close below the prior pivot low
+            choch = setup["choch_level"]
+            if not np.isnan(choch) and c < choch:
+                # Breaker confirmed
+                ob_h = setup["ob_high"]
+                ob_l = setup["ob_low"]
 
-        # Timeout in swept state: reset and fall through — don't skip with continue
-        if bull_state == "swept" and (i - bull_sweep_bar) > choch_window:
-            bull_state = "idle"
+                # Mark breaker on the bar where CHoCH fires
+                bear_breaker_arr[i]        = True
+                bear_breaker_top_arr[i]    = ob_h
+                bear_breaker_bot_arr[i]    = ob_l
+                bear_breaker_ob_bar_arr[i] = setup["ob_bar"]
 
-        # Timeout in armed state: FVG not filled within fvg_timeout bars
-        if bull_state == "armed" and (i - bull_arm_bar) > fvg_timeout:
-            bull_state = "idle"
+                # Compute overlap with the displacement FVG (if one was found)
+                if not np.isnan(setup["fvg_top"]):
+                    fvg_top = setup["fvg_top"]
+                    fvg_bot = setup["fvg_bot"]
+                    # OB zone is (ob_l, ob_h); FVG zone is (fvg_bot, fvg_top)
+                    overlap_top = min(ob_h,  fvg_top)
+                    overlap_bot = max(ob_l,  fvg_bot)
+                    if overlap_top > overlap_bot:
+                        armed_bear.append({
+                            "zone_top": overlap_top,
+                            "zone_bot": overlap_bot,
+                            "sl":       ob_h,
+                            "bar":      i,
+                            "fvg_bar":  setup["fvg_bar"],
+                            "ob_bar":   setup["ob_bar"],
+                        })
 
-        if bull_state == "idle":
-            if not np.isnan(last_pivot_low) and not np.isnan(last_pivot_high):
-                if l < last_pivot_low:
-                    bull_state = "swept"
-                    bull_choch_level = last_pivot_high
-                    bull_sweep_low = l
-                    # TP: next liquidity pool above — the pivot high before the CHoCH level
-                    bull_tp_level = second_last_pivot_high
-                    bull_sweep_bar = i
-                    bull_sweep_arr[i] = True
+                # Setup consumed — do NOT keep in still_pending_bear
+                continue
 
-        elif bull_state == "swept":
-            if c > bull_choch_level:
-                bull_choch_arr[i] = True
+            still_pending_bear.append(setup)
 
-                found_fvg = False
-                for j in range(i, max(bull_sweep_bar - 1, -1), -1):
-                    if bull_fvg[j]:
-                        bull_fvg_top_val = bull_fvg_top[j]
-                        bull_fvg_bot_val = bull_fvg_bot[j]
-                        found_fvg = True
-                        break
+        pending_bear = still_pending_bear
 
-                if found_fvg:
-                    bull_state = "armed"
-                    bull_arm_bar = i
-                    bull_fvg_armed_arr[i] = True
-                    bull_fvg_arm_top_arr[i] = bull_fvg_top_val
-                    bull_fvg_arm_bot_arr[i] = bull_fvg_bot_val
-                else:
-                    bull_state = "idle"
+        # -------------------------------------------------------------------
+        # D. For each pending BULL setup: try to find FVG and check CHoCH
+        # -------------------------------------------------------------------
+        still_pending_bull = []
+        for setup in pending_bull:
+            age = i - setup["armed_bar"]
+            if age > zone_timeout:
+                continue
 
-        elif bull_state == "armed":
-            bull_fvg_armed_arr[i] = True
-            bull_fvg_arm_top_arr[i] = bull_fvg_top_val
-            bull_fvg_arm_bot_arr[i] = bull_fvg_bot_val
-
-            # Entry: low retraces into the bullish FVG zone
-            if l <= bull_fvg_top_val:
-                buy_signal_arr[i] = True
-                # SL: below the sweep low; TP: prior pivot high (next liquidity target)
-                buy_sl_price_arr[i] = bull_sweep_low
-                buy_tp_price_arr[i] = (
-                    bull_tp_level if not np.isnan(bull_tp_level) else bull_choch_level
+            if np.isnan(setup["fvg_top"]):
+                fvg_start = setup["pivot_bar"] + 1
+                fvg_top, fvg_bot, fvg_bar = _find_bull_fvg_after(
+                    highs, lows, fvg_start, i
                 )
-                bull_state = "idle"
-            # Invalidate: price closes below the FVG bottom
-            elif c < bull_fvg_bot_val:
-                bull_state = "idle"
-            # Invalidate: price closes below the FVG bottom
-            elif c < bull_fvg_bot_val:
-                bull_state = "idle"
+                if fvg_bar >= 0:
+                    setup["fvg_top"] = fvg_top
+                    setup["fvg_bot"] = fvg_bot
+                    setup["fvg_bar"] = fvg_bar
+                    bull_fvg_arr[fvg_bar]     = True
+                    bull_fvg_top_arr[fvg_bar] = fvg_top
+                    bull_fvg_bot_arr[fvg_bar] = fvg_bot
 
-    # Store results
-    df["bear_sweep"] = bear_sweep_arr
-    df["bear_choch"] = bear_choch_arr
-    df["bear_fvg_armed"] = bear_fvg_armed_arr
-    df["bear_fvg_arm_top"] = bear_fvg_arm_top_arr
-    df["bear_fvg_arm_bot"] = bear_fvg_arm_bot_arr
-    df["sell_signal"] = sell_signal_arr
-    df["sell_sl_price"] = sell_sl_price_arr
-    df["sell_tp_price"] = sell_tp_price_arr
+            choch = setup["choch_level"]
+            if not np.isnan(choch) and c > choch:
+                # Breaker confirmed
+                ob_h = setup["ob_high"]
+                ob_l = setup["ob_low"]
 
-    df["bull_sweep"] = bull_sweep_arr
-    df["bull_choch"] = bull_choch_arr
-    df["bull_fvg_armed"] = bull_fvg_armed_arr
-    df["bull_fvg_arm_top"] = bull_fvg_arm_top_arr
-    df["bull_fvg_arm_bot"] = bull_fvg_arm_bot_arr
-    df["buy_signal"] = buy_signal_arr
-    df["buy_sl_price"] = buy_sl_price_arr
-    df["buy_tp_price"] = buy_tp_price_arr
+                bull_breaker_arr[i]        = True
+                bull_breaker_top_arr[i]    = ob_h
+                bull_breaker_bot_arr[i]    = ob_l
+                bull_breaker_ob_bar_arr[i] = setup["ob_bar"]
+
+                if not np.isnan(setup["fvg_top"]):
+                    fvg_top = setup["fvg_top"]
+                    fvg_bot = setup["fvg_bot"]
+                    overlap_top = min(ob_h,  fvg_top)
+                    overlap_bot = max(ob_l,  fvg_bot)
+                    if overlap_top > overlap_bot:
+                        armed_bull.append({
+                            "zone_top": overlap_top,
+                            "zone_bot": overlap_bot,
+                            "sl":       ob_l,
+                            "bar":      i,
+                            "fvg_bar":  setup["fvg_bar"],
+                            "ob_bar":   setup["ob_bar"],
+                        })
+
+                continue
+
+            still_pending_bull.append(setup)
+
+        pending_bull = still_pending_bull
+
+        # -------------------------------------------------------------------
+        # E. Expire old armed zones
+        # -------------------------------------------------------------------
+        armed_bear = [z for z in armed_bear if (i - z["bar"]) <= zone_timeout]
+        armed_bull = [z for z in armed_bull if (i - z["bar"]) <= zone_timeout]
+
+        # -------------------------------------------------------------------
+        # F. Entry: price retraces into an armed zone
+        # -------------------------------------------------------------------
+
+        # SELL: high taps into the bearish overlap zone (retrace UP into it)
+        hit_bear = []
+        for z in armed_bear:
+            if h >= z["zone_bot"]:  # wick reaches the bottom of the zone
+                sell_signal_arr[i]   = True
+                sell_zone_top_arr[i] = z["zone_top"]
+                sell_zone_bot_arr[i] = z["zone_bot"]
+                sl      = z["sl"]
+                entry   = c
+                sl_dist = abs(sl - entry)
+                sell_sl_arr[i]      = sl
+                sell_tp_arr[i]      = entry - 2.0 * sl_dist
+                sell_fvg_bar_arr[i] = z["fvg_bar"]
+                sell_ob_bar_arr[i]  = z["ob_bar"]
+                hit_bear.append(z)
+                break  # one signal per bar
+
+        for z in hit_bear:
+            armed_bear.remove(z)
+
+        # BUY: low taps into the bullish overlap zone (retrace DOWN into it)
+        hit_bull = []
+        for z in armed_bull:
+            if l <= z["zone_top"]:  # wick reaches the top of the zone
+                buy_signal_arr[i]   = True
+                buy_zone_top_arr[i] = z["zone_top"]
+                buy_zone_bot_arr[i] = z["zone_bot"]
+                sl      = z["sl"]
+                entry   = c
+                sl_dist = abs(entry - sl)
+                buy_sl_arr[i]      = sl
+                buy_tp_arr[i]      = entry + 2.0 * sl_dist
+                buy_fvg_bar_arr[i] = z["fvg_bar"]
+                buy_ob_bar_arr[i]  = z["ob_bar"]
+                hit_bull.append(z)
+                break
+
+        for z in hit_bull:
+            armed_bull.remove(z)
+
+    # -----------------------------------------------------------------------
+    # Store all output columns
+    # -----------------------------------------------------------------------
+    df["bear_breaker"]        = bear_breaker_arr
+    df["bear_breaker_top"]    = bear_breaker_top_arr
+    df["bear_breaker_bot"]    = bear_breaker_bot_arr
+    df["bear_breaker_ob_bar"] = bear_breaker_ob_bar_arr
+    df["bear_fvg"]         = bear_fvg_arr
+    df["bear_fvg_top"]     = bear_fvg_top_arr
+    df["bear_fvg_bot"]     = bear_fvg_bot_arr
+
+    df["bull_breaker"]        = bull_breaker_arr
+    df["bull_breaker_top"]    = bull_breaker_top_arr
+    df["bull_breaker_bot"]    = bull_breaker_bot_arr
+    df["bull_breaker_ob_bar"] = bull_breaker_ob_bar_arr
+    df["bull_fvg"]         = bull_fvg_arr
+    df["bull_fvg_top"]     = bull_fvg_top_arr
+    df["bull_fvg_bot"]     = bull_fvg_bot_arr
+
+    df["sell_signal"]   = sell_signal_arr
+    df["sell_zone_top"] = sell_zone_top_arr
+    df["sell_zone_bot"] = sell_zone_bot_arr
+    df["sell_sl_price"] = sell_sl_arr
+    df["sell_tp_price"] = sell_tp_arr
+    df["sell_fvg_bar"]  = sell_fvg_bar_arr  # integer positional index of the FVG bar
+    df["sell_ob_bar"]   = sell_ob_bar_arr   # integer positional index of the OB candle
+
+    df["buy_signal"]   = buy_signal_arr
+    df["buy_zone_top"] = buy_zone_top_arr
+    df["buy_zone_bot"] = buy_zone_bot_arr
+    df["buy_sl_price"] = buy_sl_arr
+    df["buy_tp_price"] = buy_tp_arr
+    df["buy_fvg_bar"]  = buy_fvg_bar_arr    # integer positional index of the FVG bar
+    df["buy_ob_bar"]   = buy_ob_bar_arr     # integer positional index of the OB candle
 
     return df
 
@@ -395,347 +522,220 @@ def detect_unicorn_setups(
 # Master signal calculator
 # ---------------------------------------------------------------------------
 
-
 def calculate_signals(
     df: pd.DataFrame,
-    pivot_left: int = 3,
-    pivot_right: int = 3,
-    choch_window: int = 10,
-    fvg_timeout: int = 20,
+    pivot_left: int = PIVOT_LEFT,
+    pivot_right: int = PIVOT_RIGHT,
+    zone_timeout: int = ZONE_TIMEOUT,
 ) -> pd.DataFrame:
-    df = calculate_pivots(df, left=pivot_left, right=pivot_right)
-    df = calculate_fvg(df)
-    df = detect_unicorn_setups(df, choch_window=choch_window, fvg_timeout=fvg_timeout)
-    return df
+    return detect_breaker_fvg_signals(
+        df,
+        pivot_left=pivot_left,
+        pivot_right=pivot_right,
+        zone_timeout=zone_timeout,
+    )
 
 
 # ---------------------------------------------------------------------------
-# Plotting helpers
+# Plotting
 # ---------------------------------------------------------------------------
 
-
-def build_armed_fvg_shapes(df: pd.DataFrame) -> list:
+def _build_zone_shapes(df: pd.DataFrame) -> list:
     """
-    Draw the armed Unicorn FVG zones as shaded rectangles.
-    Each zone is drawn from the bar it becomes armed to when it fires or dies.
+    Draw ONLY zones that produced a confirmed signal (i.e. had a Breaker + FVG overlap).
+
+    For each signal bar:
+      - Bearish breaker block rectangle : 10 candles wide from the CHoCH (breaker) bar
+      - Bearish FVG rectangle           : 10 candles wide from the FVG bar
+      - Overlap zone rectangle          : highlighted, from signal bar, 10 candles wide
+
+    Everything drawn only when there is a real overlap — no orphan zones.
     """
     shapes = []
     bar_dur = pd.Timedelta(hours=1)
+    idx = df.index  # DatetimeIndex — use positional lookup via iloc for FVG bar
 
-    # --- Bearish armed zones ---
-    in_zone = False
-    zone_start = None
-    zone_top = np.nan
-    zone_bot = np.nan
+    # ---- BEARISH signals ----
+    for sig_pos in np.where(df["sell_signal"].to_numpy())[0]:  # type: ignore[arg-type]
+        sig_ts = idx[sig_pos]
+        row    = df.iloc[sig_pos]
 
-    for ts, row in df.iterrows():
-        if row["bear_fvg_armed"] and not in_zone:
-            in_zone = True
-            zone_start = ts
-            zone_top = row["bear_fvg_arm_top"]
-            zone_bot = row["bear_fvg_arm_bot"]
-        elif not row["bear_fvg_armed"] and in_zone:
-            shapes.append(
-                dict(
-                    type="rect",
-                    xref="x",
-                    yref="y",
-                    x0=zone_start,
-                    x1=ts,
-                    y0=zone_bot,
-                    y1=zone_top,
-                    fillcolor="rgba(239, 83, 80, 0.22)",
-                    line=dict(color="rgba(239, 83, 80, 0.6)", width=1),
+        # Breaker block: rectangle starts at the actual OB candle bar
+        ob_bar_pos = int(row["sell_ob_bar"])
+        if ob_bar_pos >= 0:
+            ob_ts  = idx[ob_bar_pos]
+            ob_top = float(df.iloc[ob_bar_pos]["bear_breaker_top"])
+            ob_bot = float(df.iloc[ob_bar_pos]["bear_breaker_bot"])
+            # bear_breaker_top/bot are stored on the CHoCH bar, not the OB bar —
+            # so search the CHoCH bar (bear_breaker=True) for the price levels
+            # by walking forward from ob_bar_pos to find the matching choch bar
+            brk_top, brk_bot = np.nan, np.nan
+            for k in range(ob_bar_pos + 1, min(ob_bar_pos + 60, len(df))):
+                if df.iloc[k]["bear_breaker"]:
+                    brk_top = float(df.iloc[k]["bear_breaker_top"])
+                    brk_bot = float(df.iloc[k]["bear_breaker_bot"])
+                    break
+            if np.isnan(brk_top):
+                # fallback: use values stored on whatever bar has them
+                brk_top = float(row["sell_zone_top"]) if not np.isnan(row["sell_zone_top"]) else np.nan
+                brk_bot = float(row["sell_zone_bot"]) if not np.isnan(row["sell_zone_bot"]) else np.nan
+
+            if not np.isnan(brk_top):
+                shapes.append(dict(
+                    type="rect", xref="x", yref="y",
+                    x0=ob_ts,
+                    x1=sig_ts,  # ends when price taps in — breaker is consumed  # type: ignore[operator]
+                    y0=brk_bot, y1=brk_top,
+                    fillcolor="rgba(33,150,243,0.18)",
+                    line=dict(color="rgba(33,150,243,0.9)", width=1),
                     layer="below",
-                )
-            )
-            in_zone = False
-    # close any still-open zone at last bar
-    if in_zone:
-        shapes.append(
-            dict(
-                type="rect",
-                xref="x",
-                yref="y",
-                x0=zone_start,
-                x1=df.index[-1] + bar_dur * 5,
-                y0=zone_bot,
-                y1=zone_top,
-                fillcolor="rgba(239, 83, 80, 0.22)",
-                line=dict(color="rgba(239, 83, 80, 0.6)", width=1),
-                layer="below",
-            )
-        )
+                ))
 
-    # --- Bullish armed zones ---
-    in_zone = False
-    for ts, row in df.iterrows():
-        if row["bull_fvg_armed"] and not in_zone:
-            in_zone = True
-            zone_start = ts
-            zone_top = row["bull_fvg_arm_top"]
-            zone_bot = row["bull_fvg_arm_bot"]
-        elif not row["bull_fvg_armed"] and in_zone:
-            shapes.append(
-                dict(
-                    type="rect",
-                    xref="x",
-                    yref="y",
-                    x0=zone_start,
-                    x1=ts,
-                    y0=zone_bot,
-                    y1=zone_top,
-                    fillcolor="rgba(38, 166, 154, 0.22)",
-                    line=dict(color="rgba(38, 166, 154, 0.6)", width=1),
-                    layer="below",
-                )
-            )
-            in_zone = False
-    if in_zone:
-        shapes.append(
-            dict(
-                type="rect",
-                xref="x",
-                yref="y",
-                x0=zone_start,
-                x1=df.index[-1] + bar_dur * 5,
-                y0=zone_bot,
-                y1=zone_top,
-                fillcolor="rgba(38, 166, 154, 0.22)",
-                line=dict(color="rgba(38, 166, 154, 0.6)", width=1),
+        # FVG rectangle: 10 candles from the FVG bar
+        fvg_bar_pos = int(row["sell_fvg_bar"])
+        if fvg_bar_pos >= 0:
+            fvg_ts  = idx[fvg_bar_pos]
+            fvg_top = float(df.iloc[fvg_bar_pos]["bear_fvg_top"])
+            fvg_bot = float(df.iloc[fvg_bar_pos]["bear_fvg_bot"])
+            shapes.append(dict(
+                type="rect", xref="x", yref="y",
+                x0=fvg_ts,
+                x1=fvg_ts + bar_dur * 10,  # type: ignore[operator]
+                y0=fvg_bot, y1=fvg_top,
+                fillcolor="rgba(239,83,80,0.12)",
+                line=dict(color="rgba(239,83,80,0.6)", width=1, dash="dot"),
                 layer="below",
-            )
-        )
+            ))
+
+        # Overlap zone: brighter, from signal bar, 10 candles wide
+        ov_top = float(row["sell_zone_top"])
+        ov_bot = float(row["sell_zone_bot"])
+        if not (np.isnan(ov_top) or np.isnan(ov_bot)):
+            shapes.append(dict(
+                type="rect", xref="x", yref="y",
+                x0=sig_ts,
+                x1=sig_ts + bar_dur * 10,  # type: ignore[operator]
+                y0=ov_bot, y1=ov_top,
+                fillcolor="rgba(239,83,80,0.35)",
+                line=dict(color="#ef5350", width=2),
+                layer="below",
+            ))
+
+    # ---- BULLISH signals ----
+    for sig_pos in np.where(df["buy_signal"].to_numpy())[0]:  # type: ignore[arg-type]
+        sig_ts = idx[sig_pos]
+        row    = df.iloc[sig_pos]
+
+        # Breaker block: rectangle starts at the actual OB candle bar
+        ob_bar_pos = int(row["buy_ob_bar"])
+        if ob_bar_pos >= 0:
+            ob_ts  = idx[ob_bar_pos]
+            brk_top, brk_bot = np.nan, np.nan
+            for k in range(ob_bar_pos + 1, min(ob_bar_pos + 60, len(df))):
+                if df.iloc[k]["bull_breaker"]:
+                    brk_top = float(df.iloc[k]["bull_breaker_top"])
+                    brk_bot = float(df.iloc[k]["bull_breaker_bot"])
+                    break
+
+            if not np.isnan(brk_top):
+                shapes.append(dict(
+                    type="rect", xref="x", yref="y",
+                    x0=ob_ts,
+                    x1=sig_ts,  # ends when price taps in — breaker is consumed  # type: ignore[operator]
+                    y0=brk_bot, y1=brk_top,
+                    fillcolor="rgba(33,150,243,0.18)",
+                    line=dict(color="rgba(33,150,243,0.9)", width=1),
+                    layer="below",
+                ))
+
+        fvg_bar_pos = int(row["buy_fvg_bar"])
+        if fvg_bar_pos >= 0:
+            fvg_ts  = idx[fvg_bar_pos]
+            fvg_top = float(df.iloc[fvg_bar_pos]["bull_fvg_top"])
+            fvg_bot = float(df.iloc[fvg_bar_pos]["bull_fvg_bot"])
+            shapes.append(dict(
+                type="rect", xref="x", yref="y",
+                x0=fvg_ts,
+                x1=fvg_ts + bar_dur * 10,  # type: ignore[operator]
+                y0=fvg_bot, y1=fvg_top,
+                fillcolor="rgba(38,166,154,0.12)",
+                line=dict(color="rgba(38,166,154,0.6)", width=1, dash="dot"),
+                layer="below",
+            ))
+
+        ov_top = float(row["buy_zone_top"])
+        ov_bot = float(row["buy_zone_bot"])
+        if not (np.isnan(ov_top) or np.isnan(ov_bot)):
+            shapes.append(dict(
+                type="rect", xref="x", yref="y",
+                x0=sig_ts,
+                x1=sig_ts + bar_dur * 10,  # type: ignore[operator]
+                y0=ov_bot, y1=ov_top,
+                fillcolor="rgba(38,166,154,0.35)",
+                line=dict(color="#26a69a", width=2),
+                layer="below",
+            ))
 
     return shapes
 
 
 def plot_unicorn_chart(df: pd.DataFrame, symbol: str = "EURUSD") -> go.Figure:
-    """
-    Full Unicorn chart:
-      - Candlesticks
-      - Pivot High / Low markers (liquidity pools)
-      - Sweep markers (manipulation bars)
-      - CHoCH markers (market structure shift bars)
-      - Armed FVG zones (shaded — active entry windows)
-      - Buy / Sell signal markers
-      - Volume
-    """
     fig = make_subplots(
-        rows=2,
-        cols=1,
+        rows=2, cols=1,
         shared_xaxes=True,
         vertical_spacing=0.03,
         row_heights=[0.78, 0.22],
-        subplot_titles=(f"{symbol} 1H — ICT Unicorn Setups", "Volume"),
+        subplot_titles=(f"{symbol} 1H — ICT Unicorn (Breaker + FVG Overlap)", "Volume"),
     )
 
-    # --- Candlesticks ---
-    fig.add_trace(
-        go.Candlestick(
-            x=df.index,
-            open=df["open"],
-            high=df["high"],
-            low=df["low"],
-            close=df["close"],
-            name="OHLC",
-            increasing_line_color="#26a69a",
-            increasing_fillcolor="#26a69a",
-            decreasing_line_color="#ef5350",
-            decreasing_fillcolor="#ef5350",
-        ),
-        row=1,
-        col=1,
-    )
+    # Candlesticks
+    fig.add_trace(go.Candlestick(
+        x=df.index,
+        open=df["open"], high=df["high"], low=df["low"], close=df["close"],
+        name="OHLC",
+        increasing_line_color="#26a69a", increasing_fillcolor="#26a69a",
+        decreasing_line_color="#ef5350", decreasing_fillcolor="#ef5350",
+    ), row=1, col=1)
 
-    # --- Pivot Highs (liquidity pools above) ---
-    ph_bars = df[df["pivot_high"].notna()]
-    if len(ph_bars) > 0:
-        fig.add_trace(
-            go.Scatter(
-                x=ph_bars.index,
-                y=ph_bars["pivot_high"] * 1.0003,
-                mode="markers",
-                name="Pivot High (BSL)",
-                marker=dict(
-                    symbol="line-ew",
-                    size=10,
-                    color="rgba(239, 83, 80, 0.5)",
-                    line=dict(color="#ef5350", width=2),
-                ),
-            ),
-            row=1,
-            col=1,
-        )
+    # Sell signals
+    ss = df[df["sell_signal"]]
+    if len(ss):
+        fig.add_trace(go.Scatter(
+            x=ss.index, y=ss["high"] * 1.0006,
+            mode="markers", name="SELL Entry",
+            marker=dict(symbol="triangle-down", size=16,
+                        color="#f44336", line=dict(color="#b71c1c", width=2)),
+        ), row=1, col=1)
 
-    # --- Pivot Lows (liquidity pools below) ---
-    pl_bars = df[df["pivot_low"].notna()]
-    if len(pl_bars) > 0:
-        fig.add_trace(
-            go.Scatter(
-                x=pl_bars.index,
-                y=pl_bars["pivot_low"] * 0.9997,
-                mode="markers",
-                name="Pivot Low (SSL)",
-                marker=dict(
-                    symbol="line-ew",
-                    size=10,
-                    color="rgba(38, 166, 154, 0.5)",
-                    line=dict(color="#26a69a", width=2),
-                ),
-            ),
-            row=1,
-            col=1,
-        )
+    # Buy signals
+    bs = df[df["buy_signal"]]
+    if len(bs):
+        fig.add_trace(go.Scatter(
+            x=bs.index, y=bs["low"] * 0.9994,
+            mode="markers", name="BUY Entry",
+            marker=dict(symbol="triangle-up", size=16,
+                        color="#00e676", line=dict(color="#1b5e20", width=2)),
+        ), row=1, col=1)
 
-    # --- Bearish sweeps (manipulation high) ---
-    bs_bars = df[df["bear_sweep"]]
-    if len(bs_bars) > 0:
-        fig.add_trace(
-            go.Scatter(
-                x=bs_bars.index,
-                y=bs_bars["high"] * 1.0005,
-                mode="markers",
-                name="Bear Sweep (HH)",
-                marker=dict(
-                    symbol="triangle-down",
-                    size=13,
-                    color="#ff5252",
-                    line=dict(color="#b71c1c", width=1),
-                ),
-            ),
-            row=1,
-            col=1,
-        )
-
-    # --- Bullish sweeps (manipulation low) ---
-    lls_bars = df[df["bull_sweep"]]
-    if len(lls_bars) > 0:
-        fig.add_trace(
-            go.Scatter(
-                x=lls_bars.index,
-                y=lls_bars["low"] * 0.9995,
-                mode="markers",
-                name="Bull Sweep (LL)",
-                marker=dict(
-                    symbol="triangle-up",
-                    size=13,
-                    color="#69f0ae",
-                    line=dict(color="#1b5e20", width=1),
-                ),
-            ),
-            row=1,
-            col=1,
-        )
-
-    # --- Bearish CHoCH bars ---
-    bc_bars = df[df["bear_choch"]]
-    if len(bc_bars) > 0:
-        fig.add_trace(
-            go.Scatter(
-                x=bc_bars.index,
-                y=bc_bars["low"] * 0.9993,
-                mode="markers+text",
-                name="Bear CHoCH",
-                text=["CHoCH"] * len(bc_bars),
-                textposition="bottom center",
-                textfont=dict(size=9, color="#ff9100"),
-                marker=dict(
-                    symbol="x",
-                    size=10,
-                    color="#ff9100",
-                    line=dict(color="#e65100", width=1),
-                ),
-            ),
-            row=1,
-            col=1,
-        )
-
-    # --- Bullish CHoCH bars ---
-    buc_bars = df[df["bull_choch"]]
-    if len(buc_bars) > 0:
-        fig.add_trace(
-            go.Scatter(
-                x=buc_bars.index,
-                y=buc_bars["high"] * 1.0007,
-                mode="markers+text",
-                name="Bull CHoCH",
-                text=["CHoCH"] * len(buc_bars),
-                textposition="top center",
-                textfont=dict(size=9, color="#40c4ff"),
-                marker=dict(
-                    symbol="x",
-                    size=10,
-                    color="#40c4ff",
-                    line=dict(color="#01579b", width=1),
-                ),
-            ),
-            row=1,
-            col=1,
-        )
-
-    # --- Sell signals ---
-    sell_bars = df[df["sell_signal"]]
-    if len(sell_bars) > 0:
-        fig.add_trace(
-            go.Scatter(
-                x=sell_bars.index,
-                y=sell_bars["high"] * 1.0008,
-                mode="markers",
-                name="SELL Entry",
-                marker=dict(
-                    symbol="triangle-down",
-                    size=16,
-                    color="#f44336",
-                    line=dict(color="#b71c1c", width=2),
-                ),
-            ),
-            row=1,
-            col=1,
-        )
-
-    # --- Buy signals ---
-    buy_bars = df[df["buy_signal"]]
-    if len(buy_bars) > 0:
-        fig.add_trace(
-            go.Scatter(
-                x=buy_bars.index,
-                y=buy_bars["low"] * 0.9992,
-                mode="markers",
-                name="BUY Entry",
-                marker=dict(
-                    symbol="triangle-up",
-                    size=16,
-                    color="#00e676",
-                    line=dict(color="#1b5e20", width=2),
-                ),
-            ),
-            row=1,
-            col=1,
-        )
-
-    # --- Volume ---
+    # Volume
     if "volume" in df.columns:
         vol_colors = [
-            "#26a69a" if c >= o else "#ef5350" for c, o in zip(df["close"], df["open"])
+            "#26a69a" if c >= o else "#ef5350"
+            for c, o in zip(df["close"], df["open"])
         ]
-        fig.add_trace(
-            go.Bar(
-                x=df.index,
-                y=df["volume"],
-                name="Volume",
-                marker_color=vol_colors,
-                opacity=0.5,
-            ),
-            row=2,
-            col=1,
-        )
+        fig.add_trace(go.Bar(
+            x=df.index, y=df["volume"],
+            name="Volume", marker_color=vol_colors, opacity=0.5,
+        ), row=2, col=1)
 
-    # --- Armed FVG zone shapes ---
-    shapes = build_armed_fvg_shapes(df)
+    shapes = _build_zone_shapes(df)
 
-    n_sells = int(df["sell_signal"].sum())
-    n_buys = int(df["buy_signal"].sum())
+    n_sell = int(df["sell_signal"].sum())
+    n_buy  = int(df["buy_signal"].sum())
+    n_bbk  = int(df["bear_breaker"].sum())
+    n_buk  = int(df["bull_breaker"].sum())
+    n_bfvg = int(df["bear_fvg"].sum())
+    n_ufvg = int(df["bull_fvg"].sum())
 
     fig.update_layout(
         height=950,
@@ -745,18 +745,20 @@ def plot_unicorn_chart(df: pd.DataFrame, symbol: str = "EURUSD") -> go.Figure:
         showlegend=True,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         shapes=shapes,
+        margin=dict(t=120),
         title=dict(
             text=(
-                f"<b>{symbol} 1H — ICT Unicorn Model</b><br>"
-                f"<sup>Sweep + CHoCH + FVG retrace logic  |  "
-                f"Sell setups: {n_sells}  |  Buy setups: {n_buys}  |  "
-                f"Red zone = armed bearish FVG  |  Green zone = armed bullish FVG</sup>"
+                f"<b>{symbol} 1H — ICT Unicorn (Breaker + FVG Overlap)</b><br>"
+                f"<sup>"
+                f"Bear breakers: {n_bbk}  |  Bull breakers: {n_buk}  |  "
+                f"Bear FVGs: {n_bfvg}  |  Bull FVGs: {n_ufvg}  |  "
+                f"SELL signals: {n_sell}  |  BUY signals: {n_buy}"
+                f"</sup>"
             ),
-            x=0.5,
-            xanchor="center",
+            x=0.5, xanchor="center",
+            y=0.98, yanchor="top",
         ),
     )
-
     fig.update_xaxes(title_text="Date", row=2, col=1)
     fig.update_yaxes(title_text="Price", row=1, col=1)
     fig.update_yaxes(title_text="Volume", row=2, col=1)
@@ -768,22 +770,16 @@ def plot_unicorn_chart(df: pd.DataFrame, symbol: str = "EURUSD") -> go.Figure:
 # Experiment runner
 # ---------------------------------------------------------------------------
 
-
 def run_experiment(
     symbol: str = "EURUSD",
-    asset_type: str = "fx",
     start_date: str = "2025-10-01",
     end_date: str = "2026-02-27",
-    pivot_left: int = 3,
-    pivot_right: int = 3,
-    choch_window: int = 10,
-    fvg_timeout: int = 20,
+    pivot_left: int = PIVOT_LEFT,
+    pivot_right: int = PIVOT_RIGHT,
+    zone_timeout: int = ZONE_TIMEOUT,
     show_chart: bool = True,
     save_chart: bool = True,
 ) -> tuple[pd.DataFrame, go.Figure]:
-    """
-    Load EURUSD 1-minute data, resample to 1H, detect Unicorn setups, plot.
-    """
     print(f"Loading {symbol} 1-minute data ({start_date} to {end_date})...")
     loader = DataLoader()
     df_1m = loader.load_fx(symbol, start_date=start_date, end_date=end_date)
@@ -793,32 +789,16 @@ def run_experiment(
     df = loader.resample_ohlcv(df_1m, "1h")
     print(f"  {len(df):,} hourly bars  ({df.index.min()} -> {df.index.max()}).")
 
-    print("Detecting Unicorn setups...")
-    df = calculate_signals(
-        df,
-        pivot_left=pivot_left,
-        pivot_right=pivot_right,
-        choch_window=choch_window,
-        fvg_timeout=fvg_timeout,
-    )
+    print(f"Detecting setups  (pivot L/R={pivot_left}/{pivot_right}, timeout={zone_timeout})...")
+    df = calculate_signals(df, pivot_left=pivot_left, pivot_right=pivot_right,
+                           zone_timeout=zone_timeout)
 
-    n_ph = int(df["pivot_high"].notna().sum())
-    n_pl = int(df["pivot_low"].notna().sum())
-    n_bsw = int(df["bear_sweep"].sum())
-    n_llsw = int(df["bull_sweep"].sum())
-    n_bchoch = int(df["bear_choch"].sum())
-    n_buchoch = int(df["bull_choch"].sum())
-    n_sells = int(df["sell_signal"].sum())
-    n_buys = int(df["buy_signal"].sum())
-
-    print(f"  Pivot Highs (BSL)  : {n_ph}")
-    print(f"  Pivot Lows  (SSL)  : {n_pl}")
-    print(f"  Bear Sweeps (HH)   : {n_bsw}")
-    print(f"  Bull Sweeps (LL)   : {n_llsw}")
-    print(f"  Bear CHoCH         : {n_bchoch}")
-    print(f"  Bull CHoCH         : {n_buchoch}")
-    print(f"  SELL signals       : {n_sells}")
-    print(f"  BUY  signals       : {n_buys}")
+    print(f"  Bear FVGs (displacement) : {int(df['bear_fvg'].sum())}")
+    print(f"  Bull FVGs (displacement) : {int(df['bull_fvg'].sum())}")
+    print(f"  Bearish Breakers         : {int(df['bear_breaker'].sum())}")
+    print(f"  Bullish Breakers         : {int(df['bull_breaker'].sum())}")
+    print(f"  SELL signals             : {int(df['sell_signal'].sum())}")
+    print(f"  BUY  signals             : {int(df['buy_signal'].sum())}")
 
     print("Building chart...")
     fig = plot_unicorn_chart(df, symbol=symbol)
@@ -826,9 +806,9 @@ def run_experiment(
     if save_chart:
         reports_dir = Path(__file__).resolve().parent / "reports"
         reports_dir.mkdir(exist_ok=True)
-        output_path = reports_dir / f"unicorn_ict_{symbol}_1H.html"
-        fig.write_html(str(output_path))
-        print(f"  Chart saved -> {output_path}")
+        out = reports_dir / f"unicorn_ict_{symbol}_1H.html"
+        fig.write_html(str(out))
+        print(f"  Chart saved -> {out}")
 
     if show_chart:
         fig.show()

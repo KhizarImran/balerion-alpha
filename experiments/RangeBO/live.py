@@ -156,7 +156,7 @@ RR               = 2.0  # reward-to-risk
 #       Use FIXED_LOT on every trade regardless of SL distance or balance.
 # ---------------------------------------------------------------------------
 SIZING_MODE = "risk_pct"   # "risk_pct" | "fixed_lot"
-RISK_PCT    = 0.50         # used when SIZING_MODE = "risk_pct"  (1% = 0.01)
+RISK_PCT    = 0.005         # used when SIZING_MODE = "risk_pct"  (1% = 0.01)
 FIXED_LOT   = 0.10         # used when SIZING_MODE = "fixed_lot"
 PIP     = 0.01      # USDJPY pip size (0.01 for JPY pairs)
 STD_LOT = 100_000   # units per standard lot
