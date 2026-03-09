@@ -23,6 +23,7 @@ dependencies = [
     "mlflow>=2.19.0",
     "MetaTrader5>=5.0.0",
     "python-dotenv>=1.0.0",
+    "smartmoneyconcepts>=0.0.26",
 ]
 
 [project.optional-dependencies]
