@@ -42,11 +42,7 @@ from utils import DataLoader
 # ---------------------------------------------------------------------------
 # MLflow setup
 # ---------------------------------------------------------------------------
-os.environ["MLFLOW_ENABLE_PROXY_MLFLOW_ARTIFACTS"] = "true"
-
 MLFLOW_TRACKING_URI = "http://localhost:5000"
-mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
-mlflow.set_experiment("rangebo")
 
 # ---------------------------------------------------------------------------
 # Config
@@ -55,10 +51,10 @@ SYMBOL = "USDJPY"
 START_DATE = "2024-01-01"
 END_DATE = "2026-03-05"
 
-RANGE_START_HOUR = 0   # 00:00 UK inclusive
-RANGE_END_HOUR = 7     # 07:00 UK exclusive  (range locked after 06:00 bar close)
+RANGE_START_HOUR = 0  # 00:00 UK inclusive
+RANGE_END_HOUR = 7  # 07:00 UK exclusive  (range locked after 06:00 bar close)
 TRADE_CLOSE_HOUR = 16  # 16:00 UK hard exit
-RR = 2.0               # reward-to-risk ratio
+RR = 2.0  # reward-to-risk ratio
 TIMEZONE = "Europe/London"
 
 # How many days to display per chart page (keeps HTML file manageable)
@@ -118,7 +114,11 @@ def calculate_signals(df: pd.DataFrame) -> pd.DataFrame:
         day_mask = df["uk_date"] == uk_day
 
         # Range bars: hours 00..06 UK
-        range_mask = day_mask & (df["uk_hour"] >= RANGE_START_HOUR) & (df["uk_hour"] < RANGE_END_HOUR)
+        range_mask = (
+            day_mask
+            & (df["uk_hour"] >= RANGE_START_HOUR)
+            & (df["uk_hour"] < RANGE_END_HOUR)
+        )
         if range_mask.sum() == 0:
             continue
 
@@ -131,7 +131,11 @@ def calculate_signals(df: pd.DataFrame) -> pd.DataFrame:
         df.loc[day_mask, "range_low"] = r_low
 
         # Trading bars: hours 07..15 UK (16:00 bar is auto-close, not entry)
-        trade_mask = day_mask & (df["uk_hour"] >= RANGE_END_HOUR) & (df["uk_hour"] < TRADE_CLOSE_HOUR)
+        trade_mask = (
+            day_mask
+            & (df["uk_hour"] >= RANGE_END_HOUR)
+            & (df["uk_hour"] < TRADE_CLOSE_HOUR)
+        )
         trade_bars = df.index[trade_mask]
 
         trade_taken = False
@@ -171,11 +175,7 @@ def calculate_signals(df: pd.DataFrame) -> pd.DataFrame:
 
             # --- Simulate forward to find exit ---
             # Bars from the next bar until 16:00 UK on the same day
-            post_mask = (
-                day_mask
-                & (df.index > ts)
-                & (df["uk_hour"] <= TRADE_CLOSE_HOUR)
-            )
+            post_mask = day_mask & (df.index > ts) & (df["uk_hour"] <= TRADE_CLOSE_HOUR)
             post_bars = df.index[post_mask]
 
             exit_type = "time"
@@ -227,7 +227,8 @@ def calculate_signals(df: pd.DataFrame) -> pd.DataFrame:
                 exit_px = entry
 
             pnl_pips = (
-                (exit_px - entry) / pip if direction == "long"
+                (exit_px - entry) / pip
+                if direction == "long"
                 else (entry - exit_px) / pip
             )
 
@@ -257,7 +258,9 @@ def build_chart(df: pd.DataFrame, symbol: str, start: str, end: str) -> go.Figur
       - Volume subplot
     """
     # Slice to requested window
-    mask = (df.index >= pd.Timestamp(start, tz="UTC")) & (df.index <= pd.Timestamp(end, tz="UTC"))
+    mask = (df.index >= pd.Timestamp(start, tz="UTC")) & (
+        df.index <= pd.Timestamp(end, tz="UTC")
+    )
     d = df[mask].copy()
 
     if len(d) == 0:
@@ -287,13 +290,13 @@ def build_chart(df: pd.DataFrame, symbol: str, start: str, end: str) -> go.Figur
             decreasing_fillcolor="#ef5350",
             showlegend=False,
         ),
-        row=1, col=1,
+        row=1,
+        col=1,
     )
 
     # --- Volume ---
     vol_colors = [
-        "#26a69a" if c >= o else "#ef5350"
-        for c, o in zip(d["close"], d["open"])
+        "#26a69a" if c >= o else "#ef5350" for c, o in zip(d["close"], d["open"])
     ]
     fig.add_trace(
         go.Bar(
@@ -304,7 +307,8 @@ def build_chart(df: pd.DataFrame, symbol: str, start: str, end: str) -> go.Figur
             opacity=0.5,
             showlegend=False,
         ),
-        row=2, col=1,
+        row=2,
+        col=1,
     )
 
     # --- Per-day range shapes & level lines ---
@@ -318,15 +322,24 @@ def build_chart(df: pd.DataFrame, symbol: str, start: str, end: str) -> go.Figur
         day_mask = d["uk_date"] == uk_day
         day_bars = d[day_mask]
 
-        r_high = day_bars["range_high"].dropna().iloc[0] if day_bars["range_high"].notna().any() else None
-        r_low = day_bars["range_low"].dropna().iloc[0] if day_bars["range_low"].notna().any() else None
+        r_high = (
+            day_bars["range_high"].dropna().iloc[0]
+            if day_bars["range_high"].notna().any()
+            else None
+        )
+        r_low = (
+            day_bars["range_low"].dropna().iloc[0]
+            if day_bars["range_low"].notna().any()
+            else None
+        )
 
         if r_high is None or r_low is None:
             continue
 
         # Range bars (00:00–06:00) x-span for the shaded box
         range_bars = day_bars[
-            (day_bars["uk_hour"] >= RANGE_START_HOUR) & (day_bars["uk_hour"] < RANGE_END_HOUR)
+            (day_bars["uk_hour"] >= RANGE_START_HOUR)
+            & (day_bars["uk_hour"] < RANGE_END_HOUR)
         ]
         if len(range_bars) == 0:
             continue
@@ -335,15 +348,20 @@ def build_chart(df: pd.DataFrame, symbol: str, start: str, end: str) -> go.Figur
         x1 = range_bars.index[-1] + pd.Timedelta(hours=1)
 
         # Shaded accumulation zone
-        shapes.append(dict(
-            type="rect",
-            xref="x", yref="y",
-            x0=x0, x1=x1,
-            y0=r_low, y1=r_high,
-            fillcolor="rgba(120, 120, 140, 0.12)",
-            line=dict(color="rgba(180,180,200,0.3)", width=1),
-            layer="below",
-        ))
+        shapes.append(
+            dict(
+                type="rect",
+                xref="x",
+                yref="y",
+                x0=x0,
+                x1=x1,
+                y0=r_low,
+                y1=r_high,
+                fillcolor="rgba(120, 120, 140, 0.12)",
+                line=dict(color="rgba(180,180,200,0.3)", width=1),
+                layer="below",
+            )
+        )
 
         # Range High dashed line across full trading day
         all_day_bars = day_bars
@@ -356,22 +374,32 @@ def build_chart(df: pd.DataFrame, symbol: str, start: str, end: str) -> go.Figur
             else all_day_bars.index[-1] + pd.Timedelta(hours=1)
         )
 
-        shapes.append(dict(
-            type="line",
-            xref="x", yref="y",
-            x0=x_start, x1=x_end,
-            y0=r_high, y1=r_high,
-            line=dict(color="rgba(239, 83, 80, 0.5)", width=1, dash="dot"),
-            layer="below",
-        ))
-        shapes.append(dict(
-            type="line",
-            xref="x", yref="y",
-            x0=x_start, x1=x_end,
-            y0=r_low, y1=r_low,
-            line=dict(color="rgba(38, 166, 154, 0.5)", width=1, dash="dot"),
-            layer="below",
-        ))
+        shapes.append(
+            dict(
+                type="line",
+                xref="x",
+                yref="y",
+                x0=x_start,
+                x1=x_end,
+                y0=r_high,
+                y1=r_high,
+                line=dict(color="rgba(239, 83, 80, 0.5)", width=1, dash="dot"),
+                layer="below",
+            )
+        )
+        shapes.append(
+            dict(
+                type="line",
+                xref="x",
+                yref="y",
+                x0=x_start,
+                x1=x_end,
+                y0=r_low,
+                y1=r_low,
+                line=dict(color="rgba(38, 166, 154, 0.5)", width=1, dash="dot"),
+                layer="below",
+            )
+        )
 
     # --- Entry markers ---
     buy_bars = d[d["buy_signal"]]
@@ -384,10 +412,15 @@ def build_chart(df: pd.DataFrame, symbol: str, start: str, end: str) -> go.Figur
                 y=buy_bars["entry_price"],
                 mode="markers",
                 name="BUY Entry",
-                marker=dict(symbol="triangle-up", size=14, color="#00e676",
-                            line=dict(color="#1b5e20", width=1)),
+                marker=dict(
+                    symbol="triangle-up",
+                    size=14,
+                    color="#00e676",
+                    line=dict(color="#1b5e20", width=1),
+                ),
             ),
-            row=1, col=1,
+            row=1,
+            col=1,
         )
 
     if len(sell_bars) > 0:
@@ -397,10 +430,15 @@ def build_chart(df: pd.DataFrame, symbol: str, start: str, end: str) -> go.Figur
                 y=sell_bars["entry_price"],
                 mode="markers",
                 name="SELL Entry",
-                marker=dict(symbol="triangle-down", size=14, color="#f44336",
-                            line=dict(color="#b71c1c", width=1)),
+                marker=dict(
+                    symbol="triangle-down",
+                    size=14,
+                    color="#f44336",
+                    line=dict(color="#b71c1c", width=1),
+                ),
             ),
-            row=1, col=1,
+            row=1,
+            col=1,
         )
 
     # --- Exit markers (TP / SL / Time) — plot on the exit bar ---
@@ -431,37 +469,55 @@ def build_chart(df: pd.DataFrame, symbol: str, start: str, end: str) -> go.Figur
     if tp_exit_x:
         fig.add_trace(
             go.Scatter(
-                x=tp_exit_x, y=tp_exit_y,
+                x=tp_exit_x,
+                y=tp_exit_y,
                 mode="markers",
                 name="TP Hit",
-                marker=dict(symbol="star", size=12, color="#ffeb3b",
-                            line=dict(color="#f57f17", width=1)),
+                marker=dict(
+                    symbol="star",
+                    size=12,
+                    color="#ffeb3b",
+                    line=dict(color="#f57f17", width=1),
+                ),
             ),
-            row=1, col=1,
+            row=1,
+            col=1,
         )
 
     if sl_exit_x:
         fig.add_trace(
             go.Scatter(
-                x=sl_exit_x, y=sl_exit_y,
+                x=sl_exit_x,
+                y=sl_exit_y,
                 mode="markers",
                 name="SL Hit",
-                marker=dict(symbol="x", size=11, color="#ff5252",
-                            line=dict(color="#b71c1c", width=2)),
+                marker=dict(
+                    symbol="x",
+                    size=11,
+                    color="#ff5252",
+                    line=dict(color="#b71c1c", width=2),
+                ),
             ),
-            row=1, col=1,
+            row=1,
+            col=1,
         )
 
     if time_exit_x:
         fig.add_trace(
             go.Scatter(
-                x=time_exit_x, y=time_exit_y,
+                x=time_exit_x,
+                y=time_exit_y,
                 mode="markers",
                 name="Time Exit (16:00)",
-                marker=dict(symbol="circle", size=9, color="#b0bec5",
-                            line=dict(color="#546e7a", width=1)),
+                marker=dict(
+                    symbol="circle",
+                    size=9,
+                    color="#b0bec5",
+                    line=dict(color="#546e7a", width=1),
+                ),
             ),
-            row=1, col=1,
+            row=1,
+            col=1,
         )
 
     # --- Trade connector lines (entry → exit) ---
@@ -475,7 +531,9 @@ def build_chart(df: pd.DataFrame, symbol: str, start: str, end: str) -> go.Figur
             continue
 
         etype = row["exit_type"]
-        color = "#ffeb3b" if etype == "tp" else ("#ff5252" if etype == "sl" else "#b0bec5")
+        color = (
+            "#ffeb3b" if etype == "tp" else ("#ff5252" if etype == "sl" else "#b0bec5")
+        )
 
         fig.add_trace(
             go.Scatter(
@@ -486,7 +544,8 @@ def build_chart(df: pd.DataFrame, symbol: str, start: str, end: str) -> go.Figur
                 showlegend=False,
                 hoverinfo="skip",
             ),
-            row=1, col=1,
+            row=1,
+            col=1,
         )
 
     # --- Stats annotation ---
@@ -553,8 +612,8 @@ def run_experiment(
 
     # Now slice with tz-aware timestamps
     df = df[
-        (df.index >= pd.Timestamp(start_date, tz="UTC")) &
-        (df.index <= pd.Timestamp(end_date, tz="UTC"))
+        (df.index >= pd.Timestamp(start_date, tz="UTC"))
+        & (df.index <= pd.Timestamp(end_date, tz="UTC"))
     ]
 
     print(f"  Loaded {len(df):,} 1H bars  ({df.index.min()} -> {df.index.max()})")
@@ -585,32 +644,37 @@ def run_experiment(
     reports_dir.mkdir(parents=True, exist_ok=True)
 
     mlflow.start_run(run_name=f"{symbol}_1H_{start_date}_{end_date}")
-    mlflow.log_params({
-        "symbol": symbol,
-        "start_date": start_date,
-        "end_date": end_date,
-        "range_start_hour_uk": RANGE_START_HOUR,
-        "range_end_hour_uk": RANGE_END_HOUR,
-        "trade_close_hour_uk": TRADE_CLOSE_HOUR,
-        "rr": RR,
-        "timezone": TIMEZONE,
-    })
-    mlflow.log_metrics({
-        "total_trades": float(n_trades),
-        "n_long": float(n_long),
-        "n_short": float(n_short),
-        "tp_exits": float(n_tp),
-        "sl_exits": float(n_sl),
-        "time_exits": float(n_time),
-        "win_rate_pct": float(win_rate),
-        "total_pnl_pips": float(total_pips),
-    })
+    mlflow.log_params(
+        {
+            "symbol": symbol,
+            "start_date": start_date,
+            "end_date": end_date,
+            "range_start_hour_uk": RANGE_START_HOUR,
+            "range_end_hour_uk": RANGE_END_HOUR,
+            "trade_close_hour_uk": TRADE_CLOSE_HOUR,
+            "rr": RR,
+            "timezone": TIMEZONE,
+        }
+    )
+    mlflow.log_metrics(
+        {
+            "total_trades": float(n_trades),
+            "n_long": float(n_long),
+            "n_short": float(n_short),
+            "tp_exits": float(n_tp),
+            "sl_exits": float(n_sl),
+            "time_exits": float(n_time),
+            "win_rate_pct": float(win_rate),
+            "total_pnl_pips": float(total_pips),
+        }
+    )
 
     # Build chart for the full date range
     print("Building chart...")
     vbt_settings_ok = True
     try:
         import vectorbt as vbt
+
         vbt.settings.plotting["use_widgets"] = False
     except ImportError:
         vbt_settings_ok = False
@@ -623,11 +687,19 @@ def run_experiment(
         print(f"  Chart saved    -> {chart_path}")
 
         # Trades summary CSV
-        trades_csv = trade_rows[[
-            "entry_price", "sl_price", "tp_price",
-            "exit_type", "exit_bar", "exit_price", "trade_pnl_pips",
-            "buy_signal", "sell_signal",
-        ]].copy()
+        trades_csv = trade_rows[
+            [
+                "entry_price",
+                "sl_price",
+                "tp_price",
+                "exit_type",
+                "exit_bar",
+                "exit_price",
+                "trade_pnl_pips",
+                "buy_signal",
+                "sell_signal",
+            ]
+        ].copy()
         trades_path = reports_dir / "trades.csv"
         trades_csv.to_csv(trades_path)
         print(f"  Trades saved   -> {trades_path}")

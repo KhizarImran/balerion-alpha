@@ -71,13 +71,101 @@ import requests
 import MetaTrader5 as mt5
 from dotenv import load_dotenv
 
-# Import signal logic from strategy.py (same folder)
-import importlib.util
-_strategy_path = Path(__file__).resolve().parent / "strategy.py"
-_spec = importlib.util.spec_from_file_location("rangebo_strategy", _strategy_path)
-_mod = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_mod)
-calculate_signals = _mod.calculate_signals
+# ---------------------------------------------------------------------------
+# Signal calculation (self-contained — no dependency on strategy.py)
+# ---------------------------------------------------------------------------
+
+
+def calculate_signals(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Given a 1H OHLCV DataFrame (UTC-aware index), compute the Asian range
+    per day and detect breakout entries for both long and short directions.
+
+    New columns added
+    -----------------
+    uk_hour     : int   — bar open hour in UK local time
+    range_high  : float — daily range high
+    range_low   : float — daily range low
+    buy_signal  : bool  — bar that first closes above range_high after 07:00
+    sell_signal : bool  — bar that first closes below range_low  after 07:00
+    entry_price : float — close of the entry bar
+    sl_price    : float — stop-loss price
+    tp_price    : float — take-profit price (1:2 R:R)
+    """
+    df = df.copy()
+
+    df_uk = df.copy()
+    df_uk.index = df_uk.index.tz_convert(TIMEZONE)
+    df["uk_hour"] = df_uk.index.hour
+    df["uk_date"] = df_uk.index.normalize()
+
+    df["range_high"] = np.nan
+    df["range_low"] = np.nan
+    df["buy_signal"] = False
+    df["sell_signal"] = False
+    df["entry_price"] = np.nan
+    df["sl_price"] = np.nan
+    df["tp_price"] = np.nan
+
+    uk_dates = df["uk_date"].unique()
+
+    for uk_day in uk_dates:
+        day_mask = df["uk_date"] == uk_day
+
+        range_mask = (
+            day_mask
+            & (df["uk_hour"] >= RANGE_START_HOUR)
+            & (df["uk_hour"] < RANGE_END_HOUR)
+        )
+        if range_mask.sum() == 0:
+            continue
+
+        r_high = df.loc[range_mask, "high"].max()
+        r_low = df.loc[range_mask, "low"].min()
+
+        df.loc[day_mask, "range_high"] = r_high
+        df.loc[day_mask, "range_low"] = r_low
+
+        trade_mask = (
+            day_mask
+            & (df["uk_hour"] >= RANGE_END_HOUR)
+            & (df["uk_hour"] < TRADE_CLOSE_HOUR)
+        )
+        trade_bars = df.index[trade_mask]
+        trade_taken = False
+
+        for ts in trade_bars:
+            if trade_taken:
+                break
+
+            bar = df.loc[ts]
+            c = bar["close"]
+
+            is_long = c > r_high
+            is_short = c < r_low
+
+            if not is_long and not is_short:
+                continue
+
+            direction = "long" if is_long else "short"
+            entry = c
+            sl = r_low if direction == "long" else r_high
+            sl_dist = abs(entry - sl)
+
+            if sl_dist <= 0:
+                continue
+
+            tp = entry + RR * sl_dist if direction == "long" else entry - RR * sl_dist
+
+            df.loc[ts, "buy_signal"] = direction == "long"
+            df.loc[ts, "sell_signal"] = direction == "short"
+            df.loc[ts, "entry_price"] = entry
+            df.loc[ts, "sl_price"] = sl
+            df.loc[ts, "tp_price"] = tp
+            trade_taken = True
+
+    return df
+
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -104,6 +192,7 @@ log = logging.getLogger("RangeBO")
 _env_path = project_root / ".env"
 load_dotenv(dotenv_path=_env_path)
 
+
 def _require(key: str) -> str:
     """Read a required env var, exit with a clear message if missing."""
     val = os.environ.get(key, "").strip()
@@ -113,16 +202,18 @@ def _require(key: str) -> str:
         sys.exit(1)
     return val
 
+
 def _optional(key: str, default: str = "") -> str:
     return os.environ.get(key, default).strip()
 
+
 # MetaTrader 5 — required
-MT5_LOGIN    = int(_require("MT5_LOGIN"))
+MT5_LOGIN = int(_require("MT5_LOGIN"))
 MT5_PASSWORD = _require("MT5_PASSWORD")
-MT5_SERVER   = _require("MT5_SERVER")
+MT5_SERVER = _require("MT5_SERVER")
 
 # Telegram — optional (alerts silently disabled if not set)
-TELEGRAM_TOKEN   = _optional("TELEGRAM_TOKEN")
+TELEGRAM_TOKEN = _optional("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = _optional("TELEGRAM_CHAT_ID")
 
 # ---------------------------------------------------------------------------
@@ -135,15 +226,15 @@ TELEGRAM_CHAT_ID = _optional("TELEGRAM_CHAT_ID")
 #   MT5_PATH = r"C:\Program Files\MetaTrader 5 Pepperstone\terminal64.exe"
 #   MT5_PATH = None   # auto-detect (only works if you have one MT5 installed)
 # ---------------------------------------------------------------------------
-MT5_PATH = None   # e.g. r"C:\Program Files\MetaTrader 5 ICMarkets\terminal64.exe"
+MT5_PATH = r"C:\Program Files\MetaTrader 5\terminal64.exe"  # e.g. r"C:\Program Files\MetaTrader 5 ICMarkets\terminal64.exe"
 
 # Strategy — fixed constants (not user-configurable via .env)
-SYMBOL           = "USDJPY"
-TIMEZONE         = "Europe/London"
-RANGE_START_HOUR = 0    # 00:00 UK inclusive
-RANGE_END_HOUR   = 7    # 07:00 UK exclusive
-TRADE_CLOSE_HOUR = 16   # 16:00 UK hard exit
-RR               = 2.0  # reward-to-risk
+SYMBOL = "USDJPY"
+TIMEZONE = "Europe/London"
+RANGE_START_HOUR = 0  # 00:00 UK inclusive
+RANGE_END_HOUR = 7  # 07:00 UK exclusive
+TRADE_CLOSE_HOUR = 16  # 16:00 UK hard exit
+RR = 2.0  # reward-to-risk
 
 # ---------------------------------------------------------------------------
 # Sizing — edit these two lines to switch mode
@@ -155,13 +246,13 @@ RR               = 2.0  # reward-to-risk
 #   SIZING_MODE = "fixed_lot"
 #       Use FIXED_LOT on every trade regardless of SL distance or balance.
 # ---------------------------------------------------------------------------
-SIZING_MODE = "risk_pct"   # "risk_pct" | "fixed_lot"
-RISK_PCT    = 0.005         # used when SIZING_MODE = "risk_pct"  (1% = 0.01)
-FIXED_LOT   = 0.10         # used when SIZING_MODE = "fixed_lot"
-PIP     = 0.01      # USDJPY pip size (0.01 for JPY pairs)
-STD_LOT = 100_000   # units per standard lot
-MIN_LOT = 0.01      # minimum lot size accepted by broker
-LOT_STEP = 0.01     # lot granularity — MT5 rejects more than 2 decimal places
+SIZING_MODE = "risk_pct"  # "risk_pct" | "fixed_lot"
+RISK_PCT = 0.005  # used when SIZING_MODE = "risk_pct"  (1% = 0.01)
+FIXED_LOT = 0.10  # used when SIZING_MODE = "fixed_lot"
+PIP = 0.01  # USDJPY pip size (0.01 for JPY pairs)
+STD_LOT = 100_000  # units per standard lot
+MIN_LOT = 0.01  # minimum lot size accepted by broker
+LOT_STEP = 0.01  # lot granularity — MT5 rejects more than 2 decimal places
 
 # How many 1H bars to fetch from MT5 each tick
 BARS_TO_FETCH = 100
@@ -172,6 +263,7 @@ WAKEUP_EARLY_SECS = 5
 # ---------------------------------------------------------------------------
 # Telegram
 # ---------------------------------------------------------------------------
+
 
 def send_telegram(message: str) -> None:
     """
@@ -196,6 +288,7 @@ def send_telegram(message: str) -> None:
 # ---------------------------------------------------------------------------
 # MT5 connection
 # ---------------------------------------------------------------------------
+
 
 def connect_mt5() -> bool:
     """
@@ -239,8 +332,7 @@ def ensure_connected() -> None:
 
     log.warning("MT5 not connected — retrying every 60 seconds...")
     send_telegram(
-        "<b>RangeBO Alert</b>\n"
-        "MT5 connection lost. Retrying every 60 seconds..."
+        "<b>RangeBO Alert</b>\nMT5 connection lost. Retrying every 60 seconds..."
     )
 
     attempt = 0
@@ -262,6 +354,7 @@ def ensure_connected() -> None:
 # ---------------------------------------------------------------------------
 # Market data
 # ---------------------------------------------------------------------------
+
 
 def fetch_bars(n: int = BARS_TO_FETCH) -> pd.DataFrame:
     """
@@ -295,6 +388,7 @@ def fetch_bars(n: int = BARS_TO_FETCH) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 # Account helpers
 # ---------------------------------------------------------------------------
+
 
 def get_balance() -> float:
     info = mt5.account_info()
@@ -364,6 +458,7 @@ def compute_lots(sl_pips: float, balance: float) -> float:
 # Order execution
 # ---------------------------------------------------------------------------
 
+
 def get_open_position() -> "mt5.TradePosition | None":
     """
     Return the first open position for SYMBOL, or None if flat.
@@ -375,7 +470,7 @@ def get_open_position() -> "mt5.TradePosition | None":
 
 
 def open_position(
-    direction: str,   # "long" or "short"
+    direction: str,  # "long" or "short"
     lots: float,
     sl_price: float,
     tp_price: float,
@@ -389,19 +484,19 @@ def open_position(
         return False
 
     order_type = mt5.ORDER_TYPE_BUY if direction == "long" else mt5.ORDER_TYPE_SELL
-    price      = tick.ask            if direction == "long" else tick.bid
+    price = tick.ask if direction == "long" else tick.bid
 
     request = {
-        "action":    mt5.TRADE_ACTION_DEAL,
-        "symbol":    SYMBOL,
-        "volume":    lots,
-        "type":      order_type,
-        "price":     price,
-        "sl":        round(sl_price, 3),
-        "tp":        round(tp_price, 3),
-        "deviation": 20,                       # max price deviation in points
-        "magic":     20260306,                 # magic number to identify bot trades
-        "comment":   "RangeBO",
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": SYMBOL,
+        "volume": lots,
+        "type": order_type,
+        "price": price,
+        "sl": round(sl_price, 3),
+        "tp": round(tp_price, 3),
+        "deviation": 20,  # max price deviation in points
+        "magic": 20260306,  # magic number to identify bot trades
+        "comment": "RangeBO",
         "type_time": mt5.ORDER_TIME_GTC,
         "type_filling": mt5.ORDER_FILLING_IOC,
     }
@@ -426,9 +521,9 @@ def close_position(position) -> tuple[bool, float]:
     Close the given open position at market.
     Returns (success, pnl_pips).
     """
-    direction  = position.type   # 0 = BUY, 1 = SELL
+    direction = position.type  # 0 = BUY, 1 = SELL
     close_type = mt5.ORDER_TYPE_SELL if direction == 0 else mt5.ORDER_TYPE_BUY
-    tick       = mt5.symbol_info_tick(SYMBOL)
+    tick = mt5.symbol_info_tick(SYMBOL)
 
     if tick is None:
         log.error(f"Cannot get tick for {SYMBOL}: {mt5.last_error()}")
@@ -437,15 +532,15 @@ def close_position(position) -> tuple[bool, float]:
     close_price = tick.bid if direction == 0 else tick.ask
 
     request = {
-        "action":    mt5.TRADE_ACTION_DEAL,
-        "symbol":    SYMBOL,
-        "volume":    position.volume,
-        "type":      close_type,
-        "position":  position.ticket,
-        "price":     close_price,
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": SYMBOL,
+        "volume": position.volume,
+        "type": close_type,
+        "position": position.ticket,
+        "price": close_price,
         "deviation": 20,
-        "magic":     20260306,
-        "comment":   "RangeBO-TimeExit",
+        "magic": 20260306,
+        "comment": "RangeBO-TimeExit",
         "type_time": mt5.ORDER_TIME_GTC,
         "type_filling": mt5.ORDER_FILLING_IOC,
     }
@@ -460,7 +555,7 @@ def close_position(position) -> tuple[bool, float]:
     # P&L in pips
     if direction == 0:  # was long
         pnl_pips = (result.price - position.price_open) / PIP
-    else:               # was short
+    else:  # was short
         pnl_pips = (position.price_open - result.price) / PIP
 
     log.info(
@@ -473,6 +568,7 @@ def close_position(position) -> tuple[bool, float]:
 # ---------------------------------------------------------------------------
 # Strategy evaluation
 # ---------------------------------------------------------------------------
+
 
 def evaluate_bar(df: pd.DataFrame) -> dict:
     """
@@ -499,45 +595,46 @@ def evaluate_bar(df: pd.DataFrame) -> dict:
     last = df.iloc[-1]
 
     range_high = float(last["range_high"]) if pd.notna(last["range_high"]) else None
-    range_low  = float(last["range_low"])  if pd.notna(last["range_low"])  else None
+    range_low = float(last["range_low"]) if pd.notna(last["range_low"]) else None
 
-    signal      = None
+    signal = None
     entry_price = None
-    sl_price    = None
-    tp_price    = None
-    sl_pips     = None
+    sl_price = None
+    tp_price = None
+    sl_pips = None
 
     if bool(last["buy_signal"]):
-        signal      = "long"
+        signal = "long"
         entry_price = float(last["entry_price"])
-        sl_price    = float(last["sl_price"])
-        tp_price    = float(last["tp_price"])
-        sl_pips     = abs(entry_price - sl_price) / PIP
+        sl_price = float(last["sl_price"])
+        tp_price = float(last["tp_price"])
+        sl_pips = abs(entry_price - sl_price) / PIP
 
     elif bool(last["sell_signal"]):
-        signal      = "short"
+        signal = "short"
         entry_price = float(last["entry_price"])
-        sl_price    = float(last["sl_price"])
-        tp_price    = float(last["tp_price"])
-        sl_pips     = abs(entry_price - sl_price) / PIP
+        sl_price = float(last["sl_price"])
+        tp_price = float(last["tp_price"])
+        sl_pips = abs(entry_price - sl_price) / PIP
 
     return {
-        "uk_hour":      int(last["uk_hour"]),
-        "range_high":   range_high,
-        "range_low":    range_low,
-        "signal":       signal,
-        "entry_price":  entry_price,
-        "sl_price":     sl_price,
-        "tp_price":     tp_price,
-        "sl_pips":      sl_pips,
+        "uk_hour": int(last["uk_hour"]),
+        "range_high": range_high,
+        "range_low": range_low,
+        "signal": signal,
+        "entry_price": entry_price,
+        "sl_price": sl_price,
+        "tp_price": tp_price,
+        "sl_pips": sl_pips,
         "latest_close": float(last["close"]),
-        "latest_ts":    df.index[-1],
+        "latest_ts": df.index[-1],
     }
 
 
 # ---------------------------------------------------------------------------
 # Timing helpers
 # ---------------------------------------------------------------------------
+
 
 def seconds_until_next_hour() -> float:
     """
@@ -546,9 +643,7 @@ def seconds_until_next_hour() -> float:
     is fully formed and available.
     """
     now = datetime.now(timezone.utc)
-    next_hour = (now + timedelta(hours=1)).replace(
-        minute=0, second=0, microsecond=0
-    )
+    next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
     delta = (next_hour - now).total_seconds() - WAKEUP_EARLY_SECS
     return max(delta, 0.0)
 
@@ -556,6 +651,7 @@ def seconds_until_next_hour() -> float:
 def now_uk_str() -> str:
     """Current time as a readable UK-local string."""
     import zoneinfo
+
     uk = zoneinfo.ZoneInfo(TIMEZONE)
     return datetime.now(uk).strftime("%Y-%m-%d %H:%M %Z")
 
@@ -563,6 +659,7 @@ def now_uk_str() -> str:
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
+
 
 def run() -> None:
     """
@@ -572,7 +669,9 @@ def run() -> None:
     log.info("  RangeBO Live Bot — starting up")
     log.info(f"  Symbol    : {SYMBOL}")
     if SIZING_MODE == "risk_pct":
-        log.info(f"  Sizing    : risk-based {RISK_PCT * 100:.1f}% per trade  |  R:R: {RR}")
+        log.info(
+            f"  Sizing    : risk-based {RISK_PCT * 100:.1f}% per trade  |  R:R: {RR}"
+        )
     else:
         log.info(f"  Sizing    : fixed lot {FIXED_LOT}  |  R:R: {RR}")
     log.info(f"  Range     : {RANGE_START_HOUR:02d}:00–{RANGE_END_HOUR:02d}:00 UK")
@@ -629,16 +728,16 @@ def run() -> None:
             send_telegram(f"<b>RangeBO Error</b>\nevaluate_bar failed: {e}")
             continue
 
-        uk_hour     = result["uk_hour"]
-        range_high  = result["range_high"]
-        range_low   = result["range_low"]
-        signal      = result["signal"]
+        uk_hour = result["uk_hour"]
+        range_high = result["range_high"]
+        range_low = result["range_low"]
+        signal = result["signal"]
         entry_price = result["entry_price"]
-        sl_price    = result["sl_price"]
-        tp_price    = result["tp_price"]
-        sl_pips     = result["sl_pips"]
-        latest_ts   = result["latest_ts"]
-        latest_close= result["latest_close"]
+        sl_price = result["sl_price"]
+        tp_price = result["tp_price"]
+        sl_pips = result["sl_pips"]
+        latest_ts = result["latest_ts"]
+        latest_close = result["latest_close"]
 
         log.info(
             f"[{now_uk_str()}] "
@@ -696,7 +795,7 @@ def run() -> None:
             elif signal is not None:
                 # Fresh signal on a bar with no existing position — enter
                 balance = get_balance()
-                lots    = compute_lots(sl_pips, balance)
+                lots = compute_lots(sl_pips, balance)
 
                 log.info(
                     f"SIGNAL: {signal.upper()} | "
