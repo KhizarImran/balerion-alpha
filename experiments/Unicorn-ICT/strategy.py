@@ -56,14 +56,22 @@ END_DATE = "2026-03-13"
 TIMEFRAME = "1h"
 SWING_LENGTH = 10
 
-# Path to the Dukascopy 1H parquet (already 1H — no resampling needed)
-DUKASCOPY_FILES = {
-    "GBPUSD": Path(__file__).resolve().parent.parent.parent.parent
+# Auto-detect Dukascopy files: scan balerion-data for *_dukascopy_*.parquet files
+_DUKASCOPY_DIR = (
+    Path(__file__).resolve().parent.parent.parent.parent
     / "balerion-data"
     / "data"
     / "fx"
-    / "gbpusd_dukascopy_1h.parquet",
-}
+)
+DUKASCOPY_FILES = {}
+if _DUKASCOPY_DIR.exists():
+    for f in _DUKASCOPY_DIR.glob("*_dukascopy_*.parquet"):
+        # Extract symbol from filename: e.g., "gbpusd_dukascopy_1h.parquet" -> "GBPUSD"
+        symbol_from_file = f.stem.split("_dukascopy")[0].upper()
+        DUKASCOPY_FILES[symbol_from_file] = f
+
+if DUKASCOPY_FILES:
+    print(f"Auto-detected Dukascopy files: {list(DUKASCOPY_FILES.keys())}")
 
 
 def load_dukascopy(symbol: str, start: str = None, end: str = None) -> pd.DataFrame:
