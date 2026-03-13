@@ -54,11 +54,12 @@ mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
 mlflow.set_experiment("unicorn-ict")
 
 # ── config ─────────────────────────────────────────────────────────────────────
-SYMBOL = "USDJPY"
+SYMBOL = "EURUSD"
 START_DATE = "2023-11-18"
 END_DATE = "2026-03-13"
 TIMEFRAME = "1h"
 SWING_LENGTH = 10
+RISK_REWARD = 2.0  # take profit multiplier (e.g. 2.0 = 2R, 3.0 = 3R)
 
 ACCOUNT_SIZE = 10_000  # USD — real margin capital
 LEVERAGE = 100  # 1:100
@@ -170,7 +171,9 @@ def setups_to_signal_arrays(
 def run_backtest():
     # 1. Load data + detect setups
     df = load_ohlcv(SYMBOL, START_DATE, END_DATE, TIMEFRAME)
-    sell_setups, buy_setups = detect_setups(df, swing_length=SWING_LENGTH)
+    sell_setups, buy_setups = detect_setups(
+        df, swing_length=SWING_LENGTH, risk_reward=RISK_REWARD
+    )
 
     n_sell = len(sell_setups)
     n_buy = len(buy_setups)
@@ -330,6 +333,7 @@ def run_backtest():
                 "end_date": END_DATE,
                 "timeframe": TIMEFRAME,
                 "swing_length": SWING_LENGTH,
+                "risk_reward": RISK_REWARD,
                 "account_size": ACCOUNT_SIZE,
                 "leverage": LEVERAGE,
                 "risk_per_trade": RISK_PER_TRADE,

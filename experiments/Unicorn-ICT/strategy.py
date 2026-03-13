@@ -50,6 +50,8 @@ from smartmoneyconcepts import smc
 
 from utils import DataLoader
 
+# -- Parameters -----------------------------
+
 SYMBOL = "USDJPY"
 START_DATE = "2025-11-18"
 END_DATE = "2026-03-13"
@@ -57,6 +59,9 @@ TIMEFRAME = "1h"
 SWING_LENGTH = 10
 SESSION_START = 7  # UK session start hour (inclusive), 07:00
 SESSION_END = 18  # UK session end hour (exclusive), up to 17:59
+RISK_REWARD = 4.0  # take profit multiplier (e.g. 2.0 = 2R, 3.0 = 3R)
+
+# --------------------------------------------
 
 # Auto-detect Dukascopy files: scan balerion-data for *_dukascopy_*.parquet files
 _DUKASCOPY_DIR = (
@@ -118,7 +123,9 @@ def _first_true_after(arr: np.ndarray, start: int, end: int) -> int:
     return int(hits[0]) + start if len(hits) else -1
 
 
-def detect_setups(df: pd.DataFrame, swing_length: int = SWING_LENGTH):
+def detect_setups(
+    df: pd.DataFrame, swing_length: int = SWING_LENGTH, risk_reward: float = RISK_REWARD
+):
     """
     Returns:
         sell_setups : list of dicts  — bullish OB mitigated down + bearish FVG + retrace up
@@ -205,7 +212,7 @@ def detect_setups(df: pd.DataFrame, swing_length: int = SWING_LENGTH):
 
         sl = ob_top
         sl_dist = abs(sl - entry_price)
-        tp = entry_price - 2.0 * sl_dist
+        tp = entry_price - risk_reward * sl_dist
 
         sell_setups.append(
             dict(
@@ -267,7 +274,7 @@ def detect_setups(df: pd.DataFrame, swing_length: int = SWING_LENGTH):
 
         sl = ob_bottom
         sl_dist = abs(entry_price - sl)
-        tp = entry_price + 2.0 * sl_dist
+        tp = entry_price + risk_reward * sl_dist
 
         buy_setups.append(
             dict(
