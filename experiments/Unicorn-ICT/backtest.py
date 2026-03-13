@@ -56,9 +56,9 @@ mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
 mlflow.set_experiment("unicorn-ict")
 
 # ── config ─────────────────────────────────────────────────────────────────────
-SYMBOL = "EURUSD"
+SYMBOL = "GBPUSD"
 START_DATE = "2025-11-18"
-END_DATE = "2026-02-27"
+END_DATE = "2026-03-13"
 TIMEFRAME = "1h"
 SWING_LENGTH = 10
 
@@ -67,9 +67,9 @@ LEVERAGE = 100  # 1:100
 RISK_PER_TRADE = 0.01  # 1% per trade
 
 PIP = 0.0001
-PIP_VALUE_PER_LOT = 10.0  # USD per pip per standard lot (EURUSD, USD account)
+PIP_VALUE_PER_LOT = 10.0  # USD per pip per standard lot (GBPUSD, USD account)
 STD_LOT = 100_000
-FX_FEES = 0.00007  # ~0.7 pip spread per side
+FX_FEES = 0.00008  # ~0.8 pip spread per side (GBPUSD slightly wider)
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────

@@ -50,19 +50,62 @@ from smartmoneyconcepts import smc
 
 from utils import DataLoader
 
-SYMBOL = "EURUSD"
+SYMBOL = "GBPUSD"
 START_DATE = "2025-11-18"
-END_DATE = "2026-02-27"
+END_DATE = "2026-03-13"
 TIMEFRAME = "1h"
 SWING_LENGTH = 10
 
+# Path to the Dukascopy 1H parquet (already 1H — no resampling needed)
+DUKASCOPY_FILES = {
+    "GBPUSD": Path(__file__).resolve().parent.parent.parent.parent
+    / "balerion-data"
+    / "data"
+    / "fx"
+    / "gbpusd_dukascopy_1h.parquet",
+}
+
+
+def load_dukascopy(symbol: str, start: str = None, end: str = None) -> pd.DataFrame:
+    """
+    Load a Dukascopy 1H parquet file.
+    The file has 'timestamp' as a plain column (not the index) with UTC tz.
+    Returns a DatetimeIndex DataFrame with lowercase OHLCV columns.
+    """
+    path = DUKASCOPY_FILES[symbol]
+    df = pd.read_parquet(path)
+
+    # set timestamp as index, strip timezone for consistency with smc library
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True).dt.tz_localize(None)
+    df = df.set_index("timestamp")
+    df.index.name = "timestamp"
+    df = df[["open", "high", "low", "close", "volume"]]
+
+    if start:
+        df = df[df.index >= pd.Timestamp(start)]
+    if end:
+        df = df[df.index <= pd.Timestamp(end)]
+
+    df = df.dropna()
+    print(f"Loaded {len(df):,} 1h bars  ({df.index[0]} -> {df.index[-1]})")
+    return df
+
 
 def load_ohlcv(symbol, start, end, tf):
+    """Load OHLCV — uses Dukascopy file if available, else falls back to DataLoader."""
+    if symbol in DUKASCOPY_FILES:
+        return load_dukascopy(symbol, start, end)
     loader = DataLoader()
     df_1m = loader.load_fx(symbol, start_date=start, end_date=end)
     df = loader.resample_ohlcv(df_1m, tf)
     print(f"Loaded {len(df):,} {tf} bars  ({df.index[0]} -> {df.index[-1]})")
     return df
+
+
+def _first_true_after(arr: np.ndarray, start: int, end: int) -> int:
+    """Return index of first True in arr[start:end], or -1 if none."""
+    hits = np.where(arr[start:end])[0]
+    return int(hits[0]) + start if len(hits) else -1
 
 
 def detect_setups(df: pd.DataFrame, swing_length: int = SWING_LENGTH):
@@ -71,21 +114,25 @@ def detect_setups(df: pd.DataFrame, swing_length: int = SWING_LENGTH):
         sell_setups : list of dicts  — bullish OB mitigated down + bearish FVG + retrace up
         buy_setups  : list of dicts  — bearish OB mitigated up   + bullish FVG + retrace down
 
-    Each dict keys:
-        ob_ts, mit_ts           — OB rectangle span
-        fvg_ts, entry_ts        — FVG rectangle span (fvg formation → entry touch)
-        ob_top, ob_bottom       — OB zone prices
-        fvg_top, fvg_bottom     — FVG zone prices
-        entry_ts                — Timestamp of entry bar (None if not yet touched)
+    Vectorised numpy forward scans — fast enough for 150k+ bars.
     """
+    import time
+
+    t0 = time.time()
+
     swing_df = smc.swing_highs_lows(df, swing_length=swing_length)
     fvg_df = smc.fvg(df, join_consecutive=False)
+    print(f"  smc computed in {time.time() - t0:.1f}s")
 
     highs = df["high"].to_numpy()
     lows = df["low"].to_numpy()
     opens = df["open"].to_numpy()
     closes = df["close"].to_numpy()
     n = len(df)
+
+    # boolean arrays for fast numpy scans
+    is_bear_candle = closes < opens  # bearish candle mask
+    is_bull_candle = closes > opens  # bullish candle mask
 
     swing_hl = swing_df["HighLow"].to_numpy()
     swing_high_bars = np.where(swing_hl == 1)[0]
@@ -98,31 +145,28 @@ def detect_setups(df: pd.DataFrame, swing_length: int = SWING_LENGTH):
     bull_fvg_bars = np.where(fvg_type == 1)[0]
     bear_fvg_bars = np.where(fvg_type == -1)[0]
 
+    MIT_WINDOW = 121  # 120 bars = 5 days
+
     sell_setups = []
     buy_setups = []
 
     # ── SELL: bullish OB at swing low, mitigated down, bearish FVG, retrace up ──
     for sl_bar in swing_low_bars:
-        # last bearish candle at or before the swing low = bullish OB
-        ob_bar = None
-        for k in range(sl_bar, -1, -1):
-            if closes[k] < opens[k]:
-                ob_bar = k
-                break
-        if ob_bar is None:
+        # last bearish candle at or before the swing low — numpy argmax trick
+        # np.where on reversed slice, take first hit
+        cands = np.where(is_bear_candle[: sl_bar + 1])[0]
+        if len(cands) == 0:
             continue
-
+        ob_bar = int(cands[-1])
         ob_top = highs[ob_bar]
         ob_bottom = lows[ob_bar]
 
-        # mitigation: close <= OB bottom within 120 bars (5 days)
-        mit_bar = None
-        for k in range(sl_bar + 1, min(sl_bar + 121, n)):
-            if closes[k] <= ob_bottom:
-                mit_bar = k
-                break
-        if mit_bar is None:
+        # mitigation: first close <= ob_bottom within MIT_WINDOW bars after sl_bar
+        end = min(sl_bar + MIT_WINDOW, n)
+        mit_idx = _first_true_after(closes[:end] <= ob_bottom, sl_bar + 1, end)
+        if mit_idx == -1:
             continue
+        mit_bar = mit_idx
 
         # bearish FVG between ob_bar and mit_bar overlapping OB zone
         window = bear_fvg_bars[(bear_fvg_bars >= ob_bar) & (bear_fvg_bars <= mit_bar)]
@@ -130,27 +174,22 @@ def detect_setups(df: pd.DataFrame, swing_length: int = SWING_LENGTH):
         for f in window:
             ft = float(fvg_tops[f])
             fb = float(fvg_bots[f])
-            if min(ob_top, ft) > max(ob_bottom, fb):  # zones overlap
+            if min(ob_top, ft) > max(ob_bottom, fb):
                 matched = (int(f), fb, ft)
                 break
         if matched is None:
             continue
-
         fvg_bar, fvg_bot, fvg_t = matched
 
-        # entry: price retraces UP into the bearish FVG (high >= fvg_bottom)
-        entry_bar = None
-        for k in range(mit_bar + 1, n):
-            if highs[k] >= fvg_bot:
-                entry_bar = k
-                break
-        if entry_bar is None:
+        # entry: first bar after mit_bar where high >= fvg_bot
+        entry_idx = _first_true_after(highs >= fvg_bot, mit_bar + 1, n)
+        if entry_idx == -1:
             continue
-
+        entry_bar = entry_idx
         entry_price = closes[entry_bar]
-        sl = ob_top  # SL above the mitigated OB high
+        sl = ob_top
         sl_dist = abs(sl - entry_price)
-        tp = entry_price - 2.0 * sl_dist  # 2R below entry
+        tp = entry_price - 2.0 * sl_dist
 
         sell_setups.append(
             dict(
@@ -170,26 +209,20 @@ def detect_setups(df: pd.DataFrame, swing_length: int = SWING_LENGTH):
 
     # ── BUY: bearish OB at swing high, mitigated up, bullish FVG, retrace down ──
     for sh_bar in swing_high_bars:
-        # last bullish candle at or before the swing high = bearish OB
-        ob_bar = None
-        for k in range(sh_bar, -1, -1):
-            if closes[k] > opens[k]:
-                ob_bar = k
-                break
-        if ob_bar is None:
+        # last bullish candle at or before the swing high
+        cands = np.where(is_bull_candle[: sh_bar + 1])[0]
+        if len(cands) == 0:
             continue
-
+        ob_bar = int(cands[-1])
         ob_top = highs[ob_bar]
         ob_bottom = lows[ob_bar]
 
-        # mitigation: close >= OB top within 120 bars (5 days)
-        mit_bar = None
-        for k in range(sh_bar + 1, min(sh_bar + 121, n)):
-            if closes[k] >= ob_top:
-                mit_bar = k
-                break
-        if mit_bar is None:
+        # mitigation: first close >= ob_top within MIT_WINDOW bars after sh_bar
+        end = min(sh_bar + MIT_WINDOW, n)
+        mit_idx = _first_true_after(closes[:end] >= ob_top, sh_bar + 1, end)
+        if mit_idx == -1:
             continue
+        mit_bar = mit_idx
 
         # bullish FVG between ob_bar and mit_bar overlapping OB zone
         window = bull_fvg_bars[(bull_fvg_bars >= ob_bar) & (bull_fvg_bars <= mit_bar)]
@@ -202,22 +235,17 @@ def detect_setups(df: pd.DataFrame, swing_length: int = SWING_LENGTH):
                 break
         if matched is None:
             continue
-
         fvg_bar, fvg_bot, fvg_t = matched
 
-        # entry: price retraces DOWN into the bullish FVG (low <= fvg_top)
-        entry_bar = None
-        for k in range(mit_bar + 1, n):
-            if lows[k] <= fvg_t:
-                entry_bar = k
-                break
-        if entry_bar is None:
+        # entry: first bar after mit_bar where low <= fvg_t
+        entry_idx = _first_true_after(lows <= fvg_t, mit_bar + 1, n)
+        if entry_idx == -1:
             continue
-
+        entry_bar = entry_idx
         entry_price = closes[entry_bar]
-        sl = ob_bottom  # SL below the mitigated OB low
+        sl = ob_bottom
         sl_dist = abs(entry_price - sl)
-        tp = entry_price + 2.0 * sl_dist  # 2R above entry
+        tp = entry_price + 2.0 * sl_dist
 
         buy_setups.append(
             dict(
