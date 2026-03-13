@@ -7,6 +7,7 @@ from .plotting import (
     plot_multiple_indicators,
     save_plot,
 )
+from .backtest_charts import build_equity_chart, build_analytics_chart
 
 __all__ = [
     "DataLoader",
@@ -15,4 +16,6 @@ __all__ = [
     "plot_strategy_performance",
     "plot_multiple_indicators",
     "save_plot",
+    "build_equity_chart",
+    "build_analytics_chart",
 ]

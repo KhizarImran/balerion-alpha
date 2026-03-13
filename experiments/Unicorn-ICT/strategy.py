@@ -50,11 +50,13 @@ from smartmoneyconcepts import smc
 
 from utils import DataLoader
 
-SYMBOL = "GBPUSD"
+SYMBOL = "USDJPY"
 START_DATE = "2025-11-18"
 END_DATE = "2026-03-13"
 TIMEFRAME = "1h"
 SWING_LENGTH = 10
+SESSION_START = 7  # UK session start hour (inclusive), 07:00
+SESSION_END = 18  # UK session end hour (exclusive), up to 17:59
 
 # Auto-detect Dukascopy files: scan balerion-data for *_dukascopy_*.parquet files
 _DUKASCOPY_DIR = (
@@ -195,6 +197,12 @@ def detect_setups(df: pd.DataFrame, swing_length: int = SWING_LENGTH):
             continue
         entry_bar = entry_idx
         entry_price = closes[entry_bar]
+
+        # session filter: only trade during UK hours (SESSION_START to SESSION_END)
+        entry_hour = df.index[entry_bar].hour
+        if not (SESSION_START <= entry_hour < SESSION_END):
+            continue
+
         sl = ob_top
         sl_dist = abs(sl - entry_price)
         tp = entry_price - 2.0 * sl_dist
@@ -251,6 +259,12 @@ def detect_setups(df: pd.DataFrame, swing_length: int = SWING_LENGTH):
             continue
         entry_bar = entry_idx
         entry_price = closes[entry_bar]
+
+        # session filter: only trade during UK hours (SESSION_START to SESSION_END)
+        entry_hour = df.index[entry_bar].hour
+        if not (SESSION_START <= entry_hour < SESSION_END):
+            continue
+
         sl = ob_bottom
         sl_dist = abs(entry_price - sl)
         tp = entry_price + 2.0 * sl_dist

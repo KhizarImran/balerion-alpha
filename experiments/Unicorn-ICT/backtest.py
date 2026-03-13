@@ -36,11 +36,9 @@ os.environ["MLFLOW_ENABLE_PROXY_MLFLOW_ARTIFACTS"] = "true"
 import numpy as np
 import pandas as pd
 import vectorbt as vbt
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 import mlflow
 
-from utils import DataLoader
+from utils import DataLoader, build_equity_chart, build_analytics_chart
 
 # ── load strategy module ───────────────────────────────────────────────────────
 _strategy_path = Path(__file__).resolve().parent / "strategy.py"
@@ -56,8 +54,8 @@ mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
 mlflow.set_experiment("unicorn-ict")
 
 # ── config ─────────────────────────────────────────────────────────────────────
-SYMBOL = "GBPUSD"
-START_DATE = "2025-11-18"
+SYMBOL = "USDJPY"
+START_DATE = "2023-11-18"
 END_DATE = "2026-03-13"
 TIMEFRAME = "1h"
 SWING_LENGTH = 10
@@ -168,123 +166,6 @@ def setups_to_signal_arrays(
     )
 
 
-def build_equity_chart(pf, symbol, account_size):
-    # equity is on notional scale (account_size * LEVERAGE); re-anchor to real margin
-    equity_notional = pf.value()
-    init_notional = account_size * LEVERAGE
-    abs_pnl = equity_notional.iloc[-1] - init_notional
-
-    # shift equity to real dollar terms: start at account_size
-    equity = equity_notional - init_notional + account_size
-    dd = (equity - equity.cummax()) / equity.cummax() * 100
-    trades_df = pf.trades.records_readable.copy()
-
-    # y-axis padding: 10% of the total equity range, minimum $200
-    eq_range = equity.max() - equity.min()
-    pad = max(eq_range * 0.10, 200)
-    y_min = equity.min() - pad
-    y_max = equity.max() + pad
-
-    fig = make_subplots(
-        rows=2,
-        cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.05,
-        row_heights=[0.65, 0.35],
-        subplot_titles=(f"{symbol} — Equity Curve", "Drawdown %"),
-    )
-
-    fig.add_trace(
-        go.Scatter(
-            x=equity.index,
-            y=equity,
-            name="Equity",
-            line=dict(color="#26a69a", width=2),
-            fill="tonexty",
-            fillcolor="rgba(38,166,154,0.08)",
-        ),
-        row=1,
-        col=1,
-    )
-
-    if len(trades_df):
-        entry_times = pd.to_datetime(trades_df["Entry Timestamp"].values)
-        entry_equity = equity.reindex(entry_times, method="nearest").values
-        win_mask = (trades_df["PnL"] > 0).values
-        loss_mask = ~win_mask
-        if win_mask.any():
-            fig.add_trace(
-                go.Scatter(
-                    x=entry_times[win_mask],
-                    y=entry_equity[win_mask],
-                    mode="markers",
-                    name="Win",
-                    marker=dict(
-                        symbol="circle",
-                        size=8,
-                        color="#00e676",
-                        line=dict(color="#1b5e20", width=1),
-                    ),
-                ),
-                row=1,
-                col=1,
-            )
-        if loss_mask.any():
-            fig.add_trace(
-                go.Scatter(
-                    x=entry_times[loss_mask],
-                    y=entry_equity[loss_mask],
-                    mode="markers",
-                    name="Loss",
-                    marker=dict(
-                        symbol="circle",
-                        size=8,
-                        color="#f44336",
-                        line=dict(color="#b71c1c", width=1),
-                    ),
-                ),
-                row=1,
-                col=1,
-            )
-
-    fig.add_trace(
-        go.Scatter(
-            x=dd.index,
-            y=dd,
-            name="Drawdown",
-            line=dict(color="#ef5350", width=1),
-            fill="tozeroy",
-            fillcolor="rgba(239,83,80,0.15)",
-        ),
-        row=2,
-        col=1,
-    )
-
-    rom = (abs_pnl / account_size) * 100
-    fig.update_layout(
-        height=700,
-        template="plotly_dark",
-        hovermode="x unified",
-        title=dict(
-            text=(
-                f"<b>{symbol} 1H — Failed OB + FVG</b><br>"
-                f"<sup>Return on Margin: {rom:.2f}%  |  "
-                f"Sharpe: {pf.sharpe_ratio():.2f}  |  "
-                f"Win Rate: {pf.trades.win_rate() * 100:.1f}%  |  "
-                f"Trades: {pf.trades.count()}  |  "
-                f"Max DD: {pf.max_drawdown() * 100:.2f}%</sup>"
-            ),
-            x=0.5,
-            xanchor="center",
-        ),
-    )
-    fig.update_yaxes(
-        title_text="Portfolio Value ($)", row=1, col=1, range=[y_min, y_max]
-    )
-    fig.update_yaxes(title_text="Drawdown (%)", row=2, col=1)
-    return fig
-
-
 # ── main ───────────────────────────────────────────────────────────────────────
 def run_backtest():
     # 1. Load data + detect setups
@@ -334,6 +215,7 @@ def run_backtest():
         short_exits=pd.Series(False, index=df.index),
         sl_stop=combined_sl,
         tp_stop=combined_tp,
+        stop_exit_price="StopMarket",
         init_cash=ACCOUNT_SIZE * LEVERAGE,
         size=lot_units,
         size_type="amount",
@@ -398,10 +280,16 @@ def run_backtest():
     print(f"  Trades  -> {trades_path}")
 
     # equity chart
-    eq_fig = build_equity_chart(pf, SYMBOL, ACCOUNT_SIZE)
+    eq_fig = build_equity_chart(pf, SYMBOL, ACCOUNT_SIZE, LEVERAGE)
     equity_path = reports_dir / "equity.html"
     eq_fig.write_html(str(equity_path))
     print(f"  Equity  -> {equity_path}")
+
+    # analytics dashboard
+    analytics_fig = build_analytics_chart(pf, SYMBOL, ACCOUNT_SIZE, LEVERAGE)
+    analytics_path = reports_dir / "analytics.html"
+    analytics_fig.write_html(str(analytics_path))
+    print(f"  Analytics -> {analytics_path}")
 
     # native vbt report
     vbt_fig = pf.plot(
