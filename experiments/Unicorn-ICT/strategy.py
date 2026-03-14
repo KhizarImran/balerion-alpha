@@ -55,7 +55,8 @@ from utils import DataLoader
 SYMBOL = "EURUSD"
 START_DATE = "2025-11-18"
 END_DATE = "2026-03-13"
-TIMEFRAME = "1h"
+LOWER_TF = "1h"  # entry/signal timeframe
+HIGHER_TF = "1D"  # confluence FVG filter timeframe
 SWING_LENGTH = 10
 SESSION_START = 7  # UK session start hour (inclusive), 07:00
 SESSION_END = 18  # UK session end hour (exclusive), up to 17:59
@@ -128,43 +129,42 @@ def _first_true_after(arr: np.ndarray, start: int, end: int) -> int:
     return int(hits[0]) + start if len(hits) else -1
 
 
-def _build_daily_fvgs(df_1h: pd.DataFrame) -> list:
+def _build_htf_fvgs(df_lower: pd.DataFrame, higher_tf: str = HIGHER_TF) -> list:
     """
-    Resample 1H data to daily, detect FVGs, track mitigation.
+    Resample lower-TF data to the higher timeframe, detect FVGs, track mitigation.
 
-    A daily FVG at bar[i] (middle candle) is formed by bars i-1, i, i+1.
-    It becomes active from daily bar i+2 onwards (the first bar after the
-    right-forming candle — same lookahead rule as the 1H entry logic).
+    An HTF FVG at bar[i] (middle candle) is formed by bars i-1, i, i+1.
+    It becomes active from HTF bar i+2 onwards (the first bar after the
+    right-forming candle — same lookahead rule as the lower-TF entry logic).
 
-    A bearish FVG is mitigated when a daily bar CLOSES >= fvg_top.
-    A bullish FVG is mitigated when a daily bar CLOSES <= fvg_bottom.
+    A bearish FVG is mitigated when an HTF bar CLOSES >= fvg_top.
+    A bullish FVG is mitigated when an HTF bar CLOSES <= fvg_bottom.
 
     Returns a list of dicts:
         direction    : 1 (bullish) or -1 (bearish)
         top          : float
         bottom       : float
-        active_from  : pd.Timestamp — first 1H bar on/after daily bar i+2
-        active_until : pd.Timestamp or pd.NaT — first 1H bar on/after the
-                       mitigation daily bar (NaT = unmitigated)
+        active_from  : pd.Timestamp — start of HTF bar i+2
+        active_until : pd.Timestamp or pd.NaT — start of mitigation bar (NaT = unmitigated)
     """
     from utils import DataLoader
 
     loader = DataLoader()
-    df_daily = loader.resample_ohlcv(df_1h, "1D")
+    df_htf = loader.resample_ohlcv(df_lower, higher_tf)
 
-    fvg_df = smc.fvg(df_daily, join_consecutive=False)
+    fvg_df = smc.fvg(df_htf, join_consecutive=False)
 
-    daily_closes = df_daily["close"].to_numpy()
-    daily_index = df_daily.index
-    n_daily = len(df_daily)
+    htf_closes = df_htf["close"].to_numpy()
+    htf_index = df_htf.index
+    n_htf = len(df_htf)
 
     fvg_type = fvg_df["FVG"].to_numpy()
     fvg_tops = fvg_df["Top"].to_numpy()
     fvg_bots = fvg_df["Bottom"].to_numpy()
 
-    daily_fvgs = []
+    htf_fvgs = []
 
-    for i in range(n_daily):
+    for i in range(n_htf):
         d = float(fvg_type[i]) if not np.isnan(fvg_type[i]) else 0.0
         if d == 0.0:
             continue
@@ -173,24 +173,24 @@ def _build_daily_fvgs(df_1h: pd.DataFrame) -> list:
         top = float(fvg_tops[i])
         bot = float(fvg_bots[i])
 
-        # active from the start of daily bar i+2
+        # active from the start of HTF bar i+2
         active_from_idx = i + 2
-        if active_from_idx >= n_daily:
+        if active_from_idx >= n_htf:
             continue  # not enough bars to ever trade this FVG
-        active_from = daily_index[active_from_idx]
+        active_from = htf_index[active_from_idx]
 
         # scan for mitigation: from i+2 onwards
         active_until = pd.NaT
-        for j in range(active_from_idx, n_daily):
-            c = daily_closes[j]
+        for j in range(active_from_idx, n_htf):
+            c = htf_closes[j]
             if direction == -1 and c >= top:  # bearish FVG mitigated
-                active_until = daily_index[j]
+                active_until = htf_index[j]
                 break
             elif direction == 1 and c <= bot:  # bullish FVG mitigated
-                active_until = daily_index[j]
+                active_until = htf_index[j]
                 break
 
-        daily_fvgs.append(
+        htf_fvgs.append(
             dict(
                 direction=direction,
                 top=top,
@@ -201,23 +201,23 @@ def _build_daily_fvgs(df_1h: pd.DataFrame) -> list:
         )
 
     print(
-        f"  Daily FVGs: {sum(1 for f in daily_fvgs if f['direction'] == -1)} bearish, "
-        f"{sum(1 for f in daily_fvgs if f['direction'] == 1)} bullish"
+        f"  {higher_tf} FVGs: {sum(1 for f in htf_fvgs if f['direction'] == -1)} bearish, "
+        f"{sum(1 for f in htf_fvgs if f['direction'] == 1)} bullish"
     )
-    return daily_fvgs
+    return htf_fvgs
 
 
-def _in_active_daily_fvg(
+def _in_active_htf_fvg(
     entry_ts: pd.Timestamp,
     entry_price: float,
     direction: int,
-    daily_fvgs: list,
+    htf_fvgs: list,
 ) -> bool:
     """
-    Return True if entry_ts / entry_price falls inside an active daily FVG
+    Return True if entry_ts / entry_price falls inside an active HTF FVG
     that matches the given direction (1=bullish for BUY, -1=bearish for SELL).
     """
-    for fvg in daily_fvgs:
+    for fvg in htf_fvgs:
         if fvg["direction"] != direction:
             continue
         if entry_ts < fvg["active_from"]:
@@ -248,8 +248,8 @@ def detect_setups(
     fvg_df = smc.fvg(df, join_consecutive=False)
     print(f"  smc computed in {time.time() - t0:.1f}s")
 
-    # build active daily FVG list for multi-timeframe confluence filter
-    daily_fvgs = _build_daily_fvgs(df)
+    # build active HTF FVG list for multi-timeframe confluence filter
+    htf_fvgs = _build_htf_fvgs(df)
 
     highs = df["high"].to_numpy()
     lows = df["low"].to_numpy()
@@ -326,8 +326,8 @@ def detect_setups(
         if not (SESSION_START <= entry_hour < SESSION_END):
             continue
 
-        # multi-timeframe filter: entry must be inside an active daily bearish FVG
-        if not _in_active_daily_fvg(df.index[entry_bar], entry_price, -1, daily_fvgs):
+        # multi-timeframe filter: entry must be inside an active HTF bearish FVG
+        if not _in_active_htf_fvg(df.index[entry_bar], entry_price, -1, htf_fvgs):
             continue
 
         # SL above the highest boundary of the OB/FVG combined zone — gives the
@@ -400,8 +400,8 @@ def detect_setups(
         if not (SESSION_START <= entry_hour < SESSION_END):
             continue
 
-        # multi-timeframe filter: entry must be inside an active daily bullish FVG
-        if not _in_active_daily_fvg(df.index[entry_bar], entry_price, 1, daily_fvgs):
+        # multi-timeframe filter: entry must be inside an active HTF bullish FVG
+        if not _in_active_htf_fvg(df.index[entry_bar], entry_price, 1, htf_fvgs):
             continue
 
         # SL below the lowest boundary of the OB/FVG combined zone — gives the
@@ -428,20 +428,28 @@ def detect_setups(
 
     print(f"SELL setups : {len(sell_setups)}")
     print(f"BUY  setups : {len(buy_setups)}")
-    return sell_setups, buy_setups, daily_fvgs
+    return sell_setups, buy_setups, htf_fvgs
 
 
-def build_chart(df, sell_setups, buy_setups, daily_fvgs=None, symbol=SYMBOL):
+def build_chart(
+    df,
+    sell_setups,
+    buy_setups,
+    htf_fvgs=None,
+    symbol=SYMBOL,
+    lower_tf=LOWER_TF,
+    higher_tf=HIGHER_TF,
+):
     """
     3-row chart:
-      Row 1 — 1H candlesticks with OB/FVG/SL/TP overlays and entry markers
-      Row 2 — 1H volume
-      Row 3 — Daily candlesticks with all active daily FVG rectangles
+      Row 1 — Lower-TF candlesticks with OB/FVG/SL/TP overlays and entry markers
+      Row 2 — Lower-TF volume
+      Row 3 — Higher-TF candlesticks with all active HTF FVG rectangles
     """
     from utils import DataLoader
 
     loader = DataLoader()
-    df_daily = loader.resample_ohlcv(df, "1D")
+    df_htf = loader.resample_ohlcv(df, higher_tf)
 
     fig = make_subplots(
         rows=3,
@@ -450,9 +458,9 @@ def build_chart(df, sell_setups, buy_setups, daily_fvgs=None, symbol=SYMBOL):
         vertical_spacing=0.03,
         row_heights=[0.52, 0.13, 0.35],
         subplot_titles=(
-            f"{symbol} {TIMEFRAME.upper()} — Failed OB + FVG",
-            "Volume (1H)",
-            f"{symbol} Daily — FVG Zones",
+            f"{symbol} {lower_tf.upper()} — Failed OB + FVG",
+            f"Volume ({lower_tf.upper()})",
+            f"{symbol} {higher_tf.upper()} — FVG Zones",
         ),
     )
 
@@ -491,19 +499,19 @@ def build_chart(df, sell_setups, buy_setups, daily_fvgs=None, symbol=SYMBOL):
         col=1,
     )
 
-    # ── Row 3: Daily candlesticks ───────────────────────────────────────────────
-    daily_vol_colors = [
+    # ── Row 3: Higher-TF candlesticks ──────────────────────────────────────────
+    htf_vol_colors = [
         "#26a69a" if c >= o else "#ef5350"
-        for c, o in zip(df_daily["close"], df_daily["open"])
+        for c, o in zip(df_htf["close"], df_htf["open"])
     ]
     fig.add_trace(
         go.Candlestick(
-            x=df_daily.index,
-            open=df_daily["open"],
-            high=df_daily["high"],
-            low=df_daily["low"],
-            close=df_daily["close"],
-            name="OHLC Daily",
+            x=df_htf.index,
+            open=df_htf["open"],
+            high=df_htf["high"],
+            low=df_htf["low"],
+            close=df_htf["close"],
+            name=f"OHLC {higher_tf.upper()}",
             increasing_line_color="#26a69a",
             increasing_fillcolor="#26a69a",
             decreasing_line_color="#ef5350",
@@ -671,11 +679,11 @@ def build_chart(df, sell_setups, buy_setups, daily_fvgs=None, symbol=SYMBOL):
             col=1,
         )
 
-    # ── Daily FVG rectangles on row 3 ──────────────────────────────────────────
+    # ── HTF FVG rectangles on row 3 ────────────────────────────────────────────
     # Each FVG spans from active_from to active_until (or end of data if unmitigated)
-    data_end = df_daily.index[-1] + bar_width_1d * 3  # extend slightly past last bar
-    if daily_fvgs:
-        for fvg in daily_fvgs:
+    data_end = df_htf.index[-1] + bar_width_1d * 3  # extend slightly past last bar
+    if htf_fvgs:
+        for fvg in htf_fvgs:
             x1 = fvg["active_until"] if fvg["active_until"] is not pd.NaT else data_end
             if fvg["direction"] == -1:
                 # bearish FVG — red zone
@@ -730,13 +738,13 @@ def build_chart(df, sell_setups, buy_setups, daily_fvgs=None, symbol=SYMBOL):
         margin=dict(t=110),
         title=dict(
             text=(
-                f"<b>{symbol} — Failed OB + FVG  |  Daily FVG Confluence</b><br>"
+                f"<b>{symbol} — Failed OB + FVG  |  {higher_tf.upper()} FVG Confluence</b><br>"
                 f"<sup>"
                 f"SELL setups: {len(sell_setups)}  |  "
                 f"BUY setups: {len(buy_setups)}  |  "
                 f"swing_length={SWING_LENGTH}  |  "
-                f"Daily FVGs: {sum(1 for f in (daily_fvgs or []) if f['direction'] == -1)} bearish, "
-                f"{sum(1 for f in (daily_fvgs or []) if f['direction'] == 1)} bullish"
+                f"{higher_tf.upper()} FVGs: {sum(1 for f in (htf_fvgs or []) if f['direction'] == -1)} bearish, "
+                f"{sum(1 for f in (htf_fvgs or []) if f['direction'] == 1)} bullish"
                 f"</sup>"
             ),
             x=0.5,
@@ -745,23 +753,23 @@ def build_chart(df, sell_setups, buy_setups, daily_fvgs=None, symbol=SYMBOL):
             yanchor="top",
         ),
     )
-    fig.update_yaxes(title_text="Price (1H)", row=1, col=1)
+    fig.update_yaxes(title_text=f"Price ({lower_tf.upper()})", row=1, col=1)
     fig.update_yaxes(title_text="Volume", row=2, col=1)
-    fig.update_yaxes(title_text="Price (Daily)", row=3, col=1)
+    fig.update_yaxes(title_text=f"Price ({higher_tf.upper()})", row=3, col=1)
     fig.update_xaxes(title_text="Date", row=3, col=1)
 
     return fig
 
 
 if __name__ == "__main__":
-    df = load_ohlcv(SYMBOL, START_DATE, END_DATE, TIMEFRAME)
-    sell_setups, buy_setups, daily_fvgs = detect_setups(df)
+    df = load_ohlcv(SYMBOL, START_DATE, END_DATE, LOWER_TF)
+    sell_setups, buy_setups, htf_fvgs = detect_setups(df)
 
-    fig = build_chart(df, sell_setups, buy_setups, daily_fvgs=daily_fvgs)
+    fig = build_chart(df, sell_setups, buy_setups, htf_fvgs=htf_fvgs)
 
     reports_dir = Path(__file__).resolve().parent / "reports"
     reports_dir.mkdir(exist_ok=True)
-    out = reports_dir / f"failed_ob_fvg_{SYMBOL}_{TIMEFRAME}.html"
+    out = reports_dir / f"failed_ob_fvg_{SYMBOL}_{LOWER_TF}.html"
     fig.write_html(str(out))
     print(f"Chart saved -> {out}")
     fig.show()
