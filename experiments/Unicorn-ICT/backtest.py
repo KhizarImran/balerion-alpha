@@ -54,8 +54,8 @@ mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
 mlflow.set_experiment("unicorn-ict")
 
 # ── config ─────────────────────────────────────────────────────────────────────
-SYMBOL = "EURUSD"
-START_DATE = "2023-11-18"
+SYMBOL = "USDJPY"
+START_DATE = "2020-11-18"
 END_DATE = "2026-03-13"
 TIMEFRAME = "1h"
 SWING_LENGTH = 10

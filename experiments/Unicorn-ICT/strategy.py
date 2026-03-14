@@ -52,7 +52,7 @@ from utils import DataLoader
 
 # -- Parameters -----------------------------
 
-SYMBOL = "USDJPY"
+SYMBOL = "EURUSD"
 START_DATE = "2025-11-18"
 END_DATE = "2026-03-13"
 TIMEFRAME = "1h"
@@ -60,6 +60,11 @@ SWING_LENGTH = 10
 SESSION_START = 7  # UK session start hour (inclusive), 07:00
 SESSION_END = 18  # UK session end hour (exclusive), up to 17:59
 RISK_REWARD = 4.0  # take profit multiplier (e.g. 2.0 = 2R, 3.0 = 3R)
+MIN_FVG_PIPS = 5  # minimum FVG height in pips — filters out micro/noise gaps
+
+# Pip size per symbol: JPY pairs use 0.01, everything else 0.0001
+_JPY_PAIRS = {"USDJPY", "EURJPY", "GBPJPY", "AUDJPY", "CADJPY", "CHFJPY", "NZDJPY"}
+PIP_SIZE = 0.01 if SYMBOL in _JPY_PAIRS else 0.0001
 
 # --------------------------------------------
 
@@ -162,7 +167,7 @@ def detect_setups(
     bull_fvg_bars = np.where(fvg_type == 1)[0]
     bear_fvg_bars = np.where(fvg_type == -1)[0]
 
-    MIT_WINDOW = 121  # 120 bars = 5 days
+    MIT_WINDOW = 48  # 120 bars = 5 days
 
     sell_setups = []
     buy_setups = []
@@ -198,19 +203,27 @@ def detect_setups(
             continue
         fvg_bar, fvg_bot, fvg_t = matched
 
-        # entry: first bar after mit_bar where high >= fvg_bot
-        entry_idx = _first_true_after(highs >= fvg_bot, mit_bar + 1, n)
+        # FVG size filter: skip micro gaps below MIN_FVG_PIPS
+        if (fvg_t - fvg_bot) < MIN_FVG_PIPS * PIP_SIZE:
+            continue
+
+        # entry: first bar AFTER the right candle of the FVG (fvg_bar+1 is still a
+        # forming candle — earliest valid entry is fvg_bar+2, the 4th candle)
+        entry_start = max(mit_bar + 1, fvg_bar + 2)
+        entry_idx = _first_true_after(highs >= fvg_bot, entry_start, n)
         if entry_idx == -1:
             continue
         entry_bar = entry_idx
         entry_price = closes[entry_bar]
 
         # session filter: only trade during UK hours (SESSION_START to SESSION_END)
-        entry_hour = df.index[entry_bar].hour
+        entry_hour = df.index[entry_bar].hour  # type: ignore[union-attr]
         if not (SESSION_START <= entry_hour < SESSION_END):
             continue
 
-        sl = ob_top
+        # SL above the highest boundary of the OB/FVG combined zone — gives the
+        # trade room through both zones before being invalidated
+        sl = max(ob_top, fvg_t)
         sl_dist = abs(sl - entry_price)
         tp = entry_price - risk_reward * sl_dist
 
@@ -260,8 +273,14 @@ def detect_setups(
             continue
         fvg_bar, fvg_bot, fvg_t = matched
 
-        # entry: first bar after mit_bar where low <= fvg_t
-        entry_idx = _first_true_after(lows <= fvg_t, mit_bar + 1, n)
+        # FVG size filter: skip micro gaps below MIN_FVG_PIPS
+        if (fvg_t - fvg_bot) < MIN_FVG_PIPS * PIP_SIZE:
+            continue
+
+        # entry: first bar AFTER the right candle of the FVG (fvg_bar+1 is still a
+        # forming candle — earliest valid entry is fvg_bar+2, the 4th candle)
+        entry_start = max(mit_bar + 1, fvg_bar + 2)
+        entry_idx = _first_true_after(lows <= fvg_t, entry_start, n)
         if entry_idx == -1:
             continue
         entry_bar = entry_idx
@@ -272,7 +291,9 @@ def detect_setups(
         if not (SESSION_START <= entry_hour < SESSION_END):
             continue
 
-        sl = ob_bottom
+        # SL below the lowest boundary of the OB/FVG combined zone — gives the
+        # trade room through both zones before being invalidated
+        sl = min(ob_bottom, fvg_bot)
         sl_dist = abs(entry_price - sl)
         tp = entry_price + risk_reward * sl_dist
 
