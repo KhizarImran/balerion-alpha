@@ -128,6 +128,107 @@ def _first_true_after(arr: np.ndarray, start: int, end: int) -> int:
     return int(hits[0]) + start if len(hits) else -1
 
 
+def _build_daily_fvgs(df_1h: pd.DataFrame) -> list:
+    """
+    Resample 1H data to daily, detect FVGs, track mitigation.
+
+    A daily FVG at bar[i] (middle candle) is formed by bars i-1, i, i+1.
+    It becomes active from daily bar i+2 onwards (the first bar after the
+    right-forming candle — same lookahead rule as the 1H entry logic).
+
+    A bearish FVG is mitigated when a daily bar CLOSES >= fvg_top.
+    A bullish FVG is mitigated when a daily bar CLOSES <= fvg_bottom.
+
+    Returns a list of dicts:
+        direction    : 1 (bullish) or -1 (bearish)
+        top          : float
+        bottom       : float
+        active_from  : pd.Timestamp — first 1H bar on/after daily bar i+2
+        active_until : pd.Timestamp or pd.NaT — first 1H bar on/after the
+                       mitigation daily bar (NaT = unmitigated)
+    """
+    from utils import DataLoader
+
+    loader = DataLoader()
+    df_daily = loader.resample_ohlcv(df_1h, "1D")
+
+    fvg_df = smc.fvg(df_daily, join_consecutive=False)
+
+    daily_closes = df_daily["close"].to_numpy()
+    daily_index = df_daily.index
+    n_daily = len(df_daily)
+
+    fvg_type = fvg_df["FVG"].to_numpy()
+    fvg_tops = fvg_df["Top"].to_numpy()
+    fvg_bots = fvg_df["Bottom"].to_numpy()
+
+    daily_fvgs = []
+
+    for i in range(n_daily):
+        d = float(fvg_type[i]) if not np.isnan(fvg_type[i]) else 0.0
+        if d == 0.0:
+            continue
+
+        direction = int(d)  # 1 or -1
+        top = float(fvg_tops[i])
+        bot = float(fvg_bots[i])
+
+        # active from the start of daily bar i+2
+        active_from_idx = i + 2
+        if active_from_idx >= n_daily:
+            continue  # not enough bars to ever trade this FVG
+        active_from = daily_index[active_from_idx]
+
+        # scan for mitigation: from i+2 onwards
+        active_until = pd.NaT
+        for j in range(active_from_idx, n_daily):
+            c = daily_closes[j]
+            if direction == -1 and c >= top:  # bearish FVG mitigated
+                active_until = daily_index[j]
+                break
+            elif direction == 1 and c <= bot:  # bullish FVG mitigated
+                active_until = daily_index[j]
+                break
+
+        daily_fvgs.append(
+            dict(
+                direction=direction,
+                top=top,
+                bottom=bot,
+                active_from=active_from,
+                active_until=active_until,
+            )
+        )
+
+    print(
+        f"  Daily FVGs: {sum(1 for f in daily_fvgs if f['direction'] == -1)} bearish, "
+        f"{sum(1 for f in daily_fvgs if f['direction'] == 1)} bullish"
+    )
+    return daily_fvgs
+
+
+def _in_active_daily_fvg(
+    entry_ts: pd.Timestamp,
+    entry_price: float,
+    direction: int,
+    daily_fvgs: list,
+) -> bool:
+    """
+    Return True if entry_ts / entry_price falls inside an active daily FVG
+    that matches the given direction (1=bullish for BUY, -1=bearish for SELL).
+    """
+    for fvg in daily_fvgs:
+        if fvg["direction"] != direction:
+            continue
+        if entry_ts < fvg["active_from"]:
+            continue
+        if fvg["active_until"] is not pd.NaT and entry_ts >= fvg["active_until"]:
+            continue
+        if fvg["bottom"] <= entry_price <= fvg["top"]:
+            return True
+    return False
+
+
 def detect_setups(
     df: pd.DataFrame, swing_length: int = SWING_LENGTH, risk_reward: float = RISK_REWARD
 ):
@@ -135,6 +236,7 @@ def detect_setups(
     Returns:
         sell_setups : list of dicts  — bullish OB mitigated down + bearish FVG + retrace up
         buy_setups  : list of dicts  — bearish OB mitigated up   + bullish FVG + retrace down
+        daily_fvgs  : list of dicts  — active daily FVG zones used for MTF filter
 
     Vectorised numpy forward scans — fast enough for 150k+ bars.
     """
@@ -145,6 +247,9 @@ def detect_setups(
     swing_df = smc.swing_highs_lows(df, swing_length=swing_length)
     fvg_df = smc.fvg(df, join_consecutive=False)
     print(f"  smc computed in {time.time() - t0:.1f}s")
+
+    # build active daily FVG list for multi-timeframe confluence filter
+    daily_fvgs = _build_daily_fvgs(df)
 
     highs = df["high"].to_numpy()
     lows = df["low"].to_numpy()
@@ -221,6 +326,10 @@ def detect_setups(
         if not (SESSION_START <= entry_hour < SESSION_END):
             continue
 
+        # multi-timeframe filter: entry must be inside an active daily bearish FVG
+        if not _in_active_daily_fvg(df.index[entry_bar], entry_price, -1, daily_fvgs):
+            continue
+
         # SL above the highest boundary of the OB/FVG combined zone — gives the
         # trade room through both zones before being invalidated
         sl = max(ob_top, fvg_t)
@@ -291,6 +400,10 @@ def detect_setups(
         if not (SESSION_START <= entry_hour < SESSION_END):
             continue
 
+        # multi-timeframe filter: entry must be inside an active daily bullish FVG
+        if not _in_active_daily_fvg(df.index[entry_bar], entry_price, 1, daily_fvgs):
+            continue
+
         # SL below the lowest boundary of the OB/FVG combined zone — gives the
         # trade room through both zones before being invalidated
         sl = min(ob_bottom, fvg_bot)
@@ -315,20 +428,35 @@ def detect_setups(
 
     print(f"SELL setups : {len(sell_setups)}")
     print(f"BUY  setups : {len(buy_setups)}")
-    return sell_setups, buy_setups
+    return sell_setups, buy_setups, daily_fvgs
 
 
-def build_chart(df, sell_setups, buy_setups, symbol=SYMBOL):
+def build_chart(df, sell_setups, buy_setups, daily_fvgs=None, symbol=SYMBOL):
+    """
+    3-row chart:
+      Row 1 — 1H candlesticks with OB/FVG/SL/TP overlays and entry markers
+      Row 2 — 1H volume
+      Row 3 — Daily candlesticks with all active daily FVG rectangles
+    """
+    from utils import DataLoader
+
+    loader = DataLoader()
+    df_daily = loader.resample_ohlcv(df, "1D")
+
     fig = make_subplots(
-        rows=2,
+        rows=3,
         cols=1,
         shared_xaxes=True,
         vertical_spacing=0.03,
-        row_heights=[0.80, 0.20],
-        subplot_titles=(f"{symbol} {TIMEFRAME.upper()} — Failed OB + FVG", "Volume"),
+        row_heights=[0.52, 0.13, 0.35],
+        subplot_titles=(
+            f"{symbol} {TIMEFRAME.upper()} — Failed OB + FVG",
+            "Volume (1H)",
+            f"{symbol} Daily — FVG Zones",
+        ),
     )
 
-    # candlesticks
+    # ── Row 1: 1H candlesticks ──────────────────────────────────────────────────
     fig.add_trace(
         go.Candlestick(
             x=df.index,
@@ -336,7 +464,7 @@ def build_chart(df, sell_setups, buy_setups, symbol=SYMBOL):
             high=df["high"],
             low=df["low"],
             close=df["close"],
-            name="OHLC",
+            name="OHLC 1H",
             increasing_line_color="#26a69a",
             increasing_fillcolor="#26a69a",
             decreasing_line_color="#ef5350",
@@ -346,7 +474,7 @@ def build_chart(df, sell_setups, buy_setups, symbol=SYMBOL):
         col=1,
     )
 
-    # volume
+    # ── Row 2: 1H volume ────────────────────────────────────────────────────────
     vol_colors = [
         "#26a69a" if c >= o else "#ef5350" for c, o in zip(df["close"], df["open"])
     ]
@@ -357,16 +485,39 @@ def build_chart(df, sell_setups, buy_setups, symbol=SYMBOL):
             name="Volume",
             marker_color=vol_colors,
             opacity=0.5,
+            showlegend=False,
         ),
         row=2,
         col=1,
     )
 
+    # ── Row 3: Daily candlesticks ───────────────────────────────────────────────
+    daily_vol_colors = [
+        "#26a69a" if c >= o else "#ef5350"
+        for c, o in zip(df_daily["close"], df_daily["open"])
+    ]
+    fig.add_trace(
+        go.Candlestick(
+            x=df_daily.index,
+            open=df_daily["open"],
+            high=df_daily["high"],
+            low=df_daily["low"],
+            close=df_daily["close"],
+            name="OHLC Daily",
+            increasing_line_color="#26a69a",
+            increasing_fillcolor="#26a69a",
+            decreasing_line_color="#ef5350",
+            decreasing_fillcolor="#ef5350",
+        ),
+        row=3,
+        col=1,
+    )
+
     shapes = []
+    bar_width_1h = pd.Timedelta(hours=1)
+    bar_width_1d = pd.Timedelta(days=1)
 
-    # ── SELL setups ────────────────────────────────────────────────────────────
-    bar_width = pd.Timedelta(hours=1)  # 1H bars — used to extend SL/TP lines
-
+    # ── SELL setups on row 1 ────────────────────────────────────────────────────
     for s in sell_setups:
         # OB — blue rectangle
         shapes.append(
@@ -383,7 +534,7 @@ def build_chart(df, sell_setups, buy_setups, symbol=SYMBOL):
                 line=dict(color="rgba(33, 150, 243, 0.80)", width=1),
             )
         )
-        # FVG — yellow-green dashed, from formation bar to entry touch
+        # FVG — yellow-green dashed
         shapes.append(
             dict(
                 type="rect",
@@ -398,8 +549,8 @@ def build_chart(df, sell_setups, buy_setups, symbol=SYMBOL):
                 line=dict(color="rgba(205, 220, 57, 0.90)", width=1, dash="dash"),
             )
         )
-        # SL line — red dotted
-        sl_end = s["entry_ts"] + bar_width * 30
+        sl_end = s["entry_ts"] + bar_width_1h * 30
+        # SL line
         shapes.append(
             dict(
                 type="line",
@@ -412,7 +563,7 @@ def build_chart(df, sell_setups, buy_setups, symbol=SYMBOL):
                 line=dict(color="rgba(244, 67, 54, 0.8)", width=1, dash="dot"),
             )
         )
-        # TP line — green dotted
+        # TP line
         shapes.append(
             dict(
                 type="line",
@@ -426,7 +577,6 @@ def build_chart(df, sell_setups, buy_setups, symbol=SYMBOL):
             )
         )
 
-    # SELL entry markers
     if sell_setups:
         fig.add_trace(
             go.Scatter(
@@ -445,7 +595,7 @@ def build_chart(df, sell_setups, buy_setups, symbol=SYMBOL):
             col=1,
         )
 
-    # ── BUY setups ─────────────────────────────────────────────────────────────
+    # ── BUY setups on row 1 ─────────────────────────────────────────────────────
     for s in buy_setups:
         # OB — red rectangle
         shapes.append(
@@ -462,7 +612,7 @@ def build_chart(df, sell_setups, buy_setups, symbol=SYMBOL):
                 line=dict(color="rgba(239, 83, 80, 0.80)", width=1),
             )
         )
-        # FVG — orange dashed, from formation bar to entry touch
+        # FVG — orange dashed
         shapes.append(
             dict(
                 type="rect",
@@ -477,8 +627,7 @@ def build_chart(df, sell_setups, buy_setups, symbol=SYMBOL):
                 line=dict(color="rgba(255, 152, 0, 0.90)", width=1, dash="dash"),
             )
         )
-        # SL line — red dotted
-        sl_end = s["entry_ts"] + bar_width * 30
+        sl_end = s["entry_ts"] + bar_width_1h * 30
         shapes.append(
             dict(
                 type="line",
@@ -491,7 +640,6 @@ def build_chart(df, sell_setups, buy_setups, symbol=SYMBOL):
                 line=dict(color="rgba(244, 67, 54, 0.8)", width=1, dash="dot"),
             )
         )
-        # TP line — green dotted
         shapes.append(
             dict(
                 type="line",
@@ -505,7 +653,6 @@ def build_chart(df, sell_setups, buy_setups, symbol=SYMBOL):
             )
         )
 
-    # BUY entry markers
     if buy_setups:
         fig.add_trace(
             go.Scatter(
@@ -524,41 +671,93 @@ def build_chart(df, sell_setups, buy_setups, symbol=SYMBOL):
             col=1,
         )
 
+    # ── Daily FVG rectangles on row 3 ──────────────────────────────────────────
+    # Each FVG spans from active_from to active_until (or end of data if unmitigated)
+    data_end = df_daily.index[-1] + bar_width_1d * 3  # extend slightly past last bar
+    if daily_fvgs:
+        for fvg in daily_fvgs:
+            x1 = fvg["active_until"] if fvg["active_until"] is not pd.NaT else data_end
+            if fvg["direction"] == -1:
+                # bearish FVG — red zone
+                fill = "rgba(239, 83, 80, 0.20)"
+                border = "rgba(239, 83, 80, 0.80)"
+                label_color = "#ef5350"
+            else:
+                # bullish FVG — green zone
+                fill = "rgba(38, 166, 154, 0.20)"
+                border = "rgba(38, 166, 154, 0.80)"
+                label_color = "#26a69a"
+
+            shapes.append(
+                dict(
+                    type="rect",
+                    xref="x3",  # row 3 x-axis
+                    yref="y3",  # row 3 y-axis
+                    layer="below",
+                    x0=fvg["active_from"],
+                    x1=x1,
+                    y0=fvg["bottom"],
+                    y1=fvg["top"],
+                    fillcolor=fill,
+                    line=dict(color=border, width=1, dash="dash"),
+                )
+            )
+            # small label at the left edge of each FVG zone
+            direction_label = "BFVG" if fvg["direction"] == 1 else "SFVG"
+            fig.add_trace(
+                go.Scatter(
+                    x=[fvg["active_from"]],
+                    y=[(fvg["top"] + fvg["bottom"]) / 2],
+                    mode="text",
+                    text=[direction_label],
+                    textfont=dict(color=label_color, size=10),
+                    showlegend=False,
+                    hoverinfo="skip",
+                ),
+                row=3,
+                col=1,
+            )
+
     fig.update_layout(
-        height=900,
+        height=1200,
         template="plotly_dark",
         xaxis_rangeslider_visible=False,
+        xaxis2_rangeslider_visible=False,
+        xaxis3_rangeslider_visible=False,
         hovermode="x unified",
         showlegend=True,
         shapes=shapes,
         margin=dict(t=110),
         title=dict(
             text=(
-                f"<b>{symbol} {TIMEFRAME.upper()} — Failed OB + FVG</b><br>"
+                f"<b>{symbol} — Failed OB + FVG  |  Daily FVG Confluence</b><br>"
                 f"<sup>"
                 f"SELL setups: {len(sell_setups)}  |  "
                 f"BUY setups: {len(buy_setups)}  |  "
-                f"swing_length={SWING_LENGTH}"
+                f"swing_length={SWING_LENGTH}  |  "
+                f"Daily FVGs: {sum(1 for f in (daily_fvgs or []) if f['direction'] == -1)} bearish, "
+                f"{sum(1 for f in (daily_fvgs or []) if f['direction'] == 1)} bullish"
                 f"</sup>"
             ),
             x=0.5,
             xanchor="center",
-            y=0.98,
+            y=0.99,
             yanchor="top",
         ),
     )
-    fig.update_yaxes(title_text="Price", row=1, col=1)
+    fig.update_yaxes(title_text="Price (1H)", row=1, col=1)
     fig.update_yaxes(title_text="Volume", row=2, col=1)
-    fig.update_xaxes(title_text="Date", row=2, col=1)
+    fig.update_yaxes(title_text="Price (Daily)", row=3, col=1)
+    fig.update_xaxes(title_text="Date", row=3, col=1)
 
     return fig
 
 
 if __name__ == "__main__":
     df = load_ohlcv(SYMBOL, START_DATE, END_DATE, TIMEFRAME)
-    sell_setups, buy_setups = detect_setups(df)
+    sell_setups, buy_setups, daily_fvgs = detect_setups(df)
 
-    fig = build_chart(df, sell_setups, buy_setups)
+    fig = build_chart(df, sell_setups, buy_setups, daily_fvgs=daily_fvgs)
 
     reports_dir = Path(__file__).resolve().parent / "reports"
     reports_dir.mkdir(exist_ok=True)

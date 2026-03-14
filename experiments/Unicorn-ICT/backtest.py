@@ -171,7 +171,7 @@ def setups_to_signal_arrays(
 def run_backtest():
     # 1. Load data + detect setups
     df = load_ohlcv(SYMBOL, START_DATE, END_DATE, TIMEFRAME)
-    sell_setups, buy_setups = detect_setups(
+    sell_setups, buy_setups, _daily_fvgs = detect_setups(
         df, swing_length=SWING_LENGTH, risk_reward=RISK_REWARD
     )
 
