@@ -68,7 +68,12 @@ RISK_PER_TRADE = 0.01  # 1% per trade
 PIP = 0.0001
 PIP_VALUE_PER_LOT = 10.0  # USD per pip per standard lot (GBPUSD, USD account)
 STD_LOT = 100_000
-FX_FEES = 0.00008  # ~0.8 pip spread per side (GBPUSD slightly wider)
+
+# Fee model: fixed cost per round-trip trade (entry + exit combined).
+# Realistic for retail FX where you pay spread, not a % of notional.
+# ~0.8 pip spread on EURUSD at ~1.10 = ~$8 per round-trip; $8 is conservative.
+FX_FEES = 0.0  # disabled in vectorbt — subtracted manually post-simulation
+FIXED_FEE_PER_TRADE = 8.0  # USD per round-trip
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
@@ -219,7 +224,7 @@ def run_backtest():
         sl_stop=combined_sl,
         tp_stop=combined_tp,
         stop_exit_price="StopMarket",
-        init_cash=ACCOUNT_SIZE * LEVERAGE,
+        init_cash=ACCOUNT_SIZE,
         size=lot_units,
         size_type="amount",
         fees=FX_FEES,
@@ -228,12 +233,15 @@ def run_backtest():
     )
 
     # 4. Compute metrics
-    abs_pnl = pf.value().iloc[-1] - (ACCOUNT_SIZE * LEVERAGE)
+    stats = pf.stats()
+    gross_pnl = pf.value().iloc[-1] - ACCOUNT_SIZE
+    total_trades = int(stats.get("Total Trades", 0))
+    total_fees = total_trades * FIXED_FEE_PER_TRADE
+    abs_pnl = gross_pnl - total_fees
     return_on_margin = (abs_pnl / ACCOUNT_SIZE) * 100
     sharpe = pf.sharpe_ratio()
     sortino = pf.sortino_ratio()
     max_dd = pf.max_drawdown() * 100
-    total_trades = pf.trades.count()
     win_rate = pf.trades.win_rate() * 100 if total_trades > 0 else 0.0
     profit_factor = pf.trades.profit_factor() if total_trades > 0 else 0.0
 
@@ -244,13 +252,15 @@ def run_backtest():
     print(f"  Account: ${ACCOUNT_SIZE:,}  |  Leverage: {LEVERAGE}:1")
     print(f"  Risk   : {RISK_PER_TRADE * 100:.1f}% per trade")
     print("=" * 58)
-    print(f"  Abs P&L           : ${abs_pnl:+,.2f}")
+    print(f"  Total Trades      : {total_trades}")
+    print(f"  Gross P&L         : ${gross_pnl:+,.2f}")
+    print(f"  Total fees        : ${total_fees:,.2f} (${FIXED_FEE_PER_TRADE}/trade)")
+    print(f"  Net P&L           : ${abs_pnl:+,.2f}")
     print(f"  Return on Margin  : {return_on_margin:+.2f}%")
+    print(f"  Win Rate          : {win_rate:.1f}%")
     print(f"  Sharpe Ratio      : {sharpe:.2f}")
     print(f"  Sortino Ratio     : {sortino:.2f}")
     print(f"  Max Drawdown      : {max_dd:.2f}%")
-    print(f"  Total Trades      : {total_trades}")
-    print(f"  Win Rate          : {win_rate:.1f}%")
     print(f"  Profit Factor     : {profit_factor:.2f}")
     print("=" * 58)
 
@@ -266,9 +276,13 @@ def run_backtest():
         f.write(f"Period    : {START_DATE} to {END_DATE}\n")
         f.write(f"Account   : ${ACCOUNT_SIZE:,}  Leverage: {LEVERAGE}:1\n")
         f.write(f"Risk/trade: {RISK_PER_TRADE * 100:.1f}%\n")
-        f.write(f"Swing len : {SWING_LENGTH}\n\n")
+        f.write(f"Swing len : {SWING_LENGTH}\n")
+        f.write(f"Fixed fee : ${FIXED_FEE_PER_TRADE} per round-trip\n\n")
         f.write(str(pf.stats()))
-        f.write(f"\n\nAbs P&L          : ${abs_pnl:+,.2f}\n")
+        f.write(f"\n\nTotal Trades     : {total_trades}\n")
+        f.write(f"Gross P&L        : ${gross_pnl:+,.2f}\n")
+        f.write(f"Total fees       : ${total_fees:,.2f}\n")
+        f.write(f"Net P&L          : ${abs_pnl:+,.2f}\n")
         f.write(f"Return on Margin : {return_on_margin:+.2f}%\n")
         f.write(f"Sharpe           : {sharpe:.2f}\n")
         f.write(f"Max Drawdown     : {max_dd:.2f}%\n")
@@ -337,13 +351,15 @@ def run_backtest():
                 "account_size": ACCOUNT_SIZE,
                 "leverage": LEVERAGE,
                 "risk_per_trade": RISK_PER_TRADE,
-                "fx_fees": FX_FEES,
+                "fixed_fee_per_trade": FIXED_FEE_PER_TRADE,
                 "n_sell_setups": n_sell,
                 "n_buy_setups": n_buy,
             }
         )
         mlflow.log_metrics(
             {
+                "gross_pnl": float(gross_pnl),
+                "total_fees": float(total_fees),
                 "abs_pnl": float(abs_pnl),
                 "return_on_margin_pct": float(return_on_margin),
                 "sharpe_ratio": float(sharpe),

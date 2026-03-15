@@ -1,7 +1,7 @@
 """
-Range Breakout — Strategy Visualisation
+Range Breakout — Strategy Signal Detection + Visualisation
 
-Detects the Asian/pre-London range (00:00–07:00 UK time) on USDJPY 1H,
+Detects the Asian/pre-London range (00:00-07:00 UK time) on USDJPY 1H,
 identifies bullish and bearish breakout entries, and produces an interactive
 Plotly candlestick chart showing:
 
@@ -12,7 +12,12 @@ Plotly candlestick chart showing:
   - SL markers (stop-loss exits)
   - Time-exit markers (16:00 UK auto-close)
 
-The chart is saved as an HTML artifact and pushed to MLflow.
+The chart is saved as an HTML artifact.
+
+Conforms to STRATEGY_BACKTEST_PATTERN.md:
+  - load_ohlcv(symbol, start, end, tf) -> pd.DataFrame  (tz-naive, lowercase cols)
+  - detect_setups(df, ...) -> (sell_setups, buy_setups, extra)
+  - Each setup dict has at minimum: entry_ts, entry, sl, tp
 
 Usage:
     uv run python experiments/RangeBO/strategy.py
@@ -26,98 +31,158 @@ from pathlib import Path
 project_root = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(project_root))
 
-# Fix Windows cp1252 terminal encoding
 if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+os.environ["SMC_CREDIT"] = "0"
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from datetime import datetime
-import mlflow
 
 from utils import DataLoader
-
-# ---------------------------------------------------------------------------
-# MLflow setup
-# ---------------------------------------------------------------------------
-MLFLOW_TRACKING_URI = "http://localhost:5000"
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 SYMBOL = "USDJPY"
-START_DATE = "2024-01-01"
+START_DATE = "2022-01-01"
 END_DATE = "2026-03-05"
+LOWER_TF = "1h"
 
-RANGE_START_HOUR = 0  # 00:00 UK inclusive
-RANGE_END_HOUR = 7  # 07:00 UK exclusive  (range locked after 06:00 bar close)
+RANGE_START_HOUR = 3  # 00:00 UK inclusive
+RANGE_END_HOUR = 7  # 07:00 UK exclusive (range locked after 06:00 bar close)
 TRADE_CLOSE_HOUR = 16  # 16:00 UK hard exit
-RR = 2.0  # reward-to-risk ratio
+RISK_REWARD = 2.0  # TP = RISK_REWARD * SL distance
 TIMEZONE = "Europe/London"
 
-# How many days to display per chart page (keeps HTML file manageable)
-DAYS_PER_CHART = 30
+MIN_RANGE_PIPS = 15  # skip thin/dead Asian sessions (range too narrow)
+MAX_RANGE_PIPS = 100  # skip blown-out news/event days (range too wide)
+
+_JPY_PAIRS = {"USDJPY", "EURJPY", "GBPJPY", "AUDJPY", "CADJPY", "CHFJPY", "NZDJPY"}
+PIP_SIZE = 0.01 if SYMBOL in _JPY_PAIRS else 0.0001
+
+
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
+
+
+_BALERION_DATA = (
+    Path(__file__).resolve().parent.parent.parent.parent / "balerion-data" / "data"
+)
+
+
+def load_ohlcv(
+    symbol: str = SYMBOL,
+    start: str = START_DATE,
+    end: str = END_DATE,
+    tf: str = LOWER_TF,
+) -> pd.DataFrame:
+    """
+    Load OHLCV data for the given symbol and date range.
+
+    Preference order:
+      1. Dukascopy 1H parquet  — {balerion-data}/data/fx/{symbol_lower}/{symbol_lower}_dukascopy_1h.parquet
+      2. DataLoader fallback   — MT5 1m resampled to tf
+
+    Returns a DataFrame with:
+      - tz-naive DatetimeIndex (UTC stripped)
+      - lowercase columns: open, high, low, close, volume
+    """
+    sym_lower = symbol.lower()
+
+    # 1. Try Dukascopy 1H file
+    duka_path = _BALERION_DATA / "fx" / sym_lower / f"{sym_lower}_dukascopy_1h.parquet"
+    if duka_path.exists():
+        df = pd.read_parquet(duka_path)
+        # timestamp is a column, not the index
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+        df = df.set_index("timestamp")
+        df.index = df.index.tz_localize(None)  # strip UTC, keep tz-naive
+        df = df[["open", "high", "low", "close", "volume"]]
+        # Date filter
+        if start:
+            df = df[df.index >= pd.Timestamp(start)]
+        if end:
+            df = df[df.index <= pd.Timestamp(end)]
+        return df
+
+    # 2. Fallback: DataLoader (MT5 1m resampled)
+    loader = DataLoader()
+    df_1m = loader.load_fx(symbol, start_date=start, end_date=end)
+    if tf in ("1m", "1min"):
+        df = df_1m
+    else:
+        df = loader.resample_ohlcv(df_1m, tf)
+
+    if df.index.tz is not None:
+        df.index = df.index.tz_localize(None)
+
+    return df
+
 
 # ---------------------------------------------------------------------------
 # Signal detection
 # ---------------------------------------------------------------------------
 
 
-def calculate_signals(df: pd.DataFrame) -> pd.DataFrame:
+def detect_setups(
+    df: pd.DataFrame,
+    risk_reward: float = RISK_REWARD,
+    range_start_hour: int = RANGE_START_HOUR,
+    range_end_hour: int = RANGE_END_HOUR,
+    trade_close_hour: int = TRADE_CLOSE_HOUR,
+    timezone: str = TIMEZONE,
+    min_range_pips: float = MIN_RANGE_PIPS,
+    max_range_pips: float = MAX_RANGE_PIPS,
+) -> tuple:
     """
-    Given a 1H OHLCV DataFrame (UTC-aware index), compute the Asian range
-    per day and detect breakout entries for both long and short directions.
+    Detect Asian range breakout setups from a 1H OHLCV DataFrame.
 
-    New columns added
-    -----------------
-    uk_hour        : int   — bar open hour in UK local time
-    range_high     : float — daily range high (NaN outside 07:00+ bars)
-    range_low      : float — daily range low  (NaN outside 07:00+ bars)
-    buy_signal     : bool  — bar that first closes above range_high after 07:00
-    sell_signal    : bool  — bar that first closes below range_low  after 07:00
-    entry_price    : float — close of the entry bar
-    sl_price       : float — stop-loss price
-    tp_price       : float — take-profit price (1:2 R:R)
-    exit_type      : str   — 'tp' | 'sl' | 'time' | '' — how the trade closed
-    exit_bar       : Timestamp — index of the exit bar
-    exit_price     : float — price at exit
-    trade_pnl_pips : float — signed P&L in pips (pip = 0.01 for JPY pairs)
+    For each trading day:
+      1. Build the range from bars 00:00-06:59 UK time
+      2. Scan bars from range_end_hour onwards for the first breakout
+      3. Long  entry when close > range_high (SL at range_low)
+      4. Short entry when close < range_low  (SL at range_high)
+      5. TP at risk_reward * SL distance
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        1H OHLCV with a tz-naive DatetimeIndex (UTC).
+
+    Returns
+    -------
+    sell_setups : list of dicts  (entry_ts, entry, sl, tp, range_high, range_low, direction)
+    buy_setups  : list of dicts  (entry_ts, entry, sl, tp, range_high, range_low, direction)
+    extra       : dict           (day_ranges — list of per-day range dicts for charting)
     """
     df = df.copy()
 
-    # Convert UTC index to UK local time for session logic
-    df_uk = df.copy()
-    df_uk.index = df_uk.index.tz_convert(TIMEZONE)
+    # Attach UK hour and date — localise to UTC first so tz_convert works
+    df_utc = df.copy()
+    df_utc.index = df_utc.index.tz_localize("UTC")
+    df_uk = df_utc.copy()
+    df_uk.index = df_uk.index.tz_convert(timezone)
+
     df["uk_hour"] = df_uk.index.hour
-    df["uk_date"] = df_uk.index.normalize()  # date in UK time
+    df["uk_date"] = df_uk.index.normalize().tz_localize(None)
 
-    # Output columns
-    df["range_high"] = np.nan
-    df["range_low"] = np.nan
-    df["buy_signal"] = False
-    df["sell_signal"] = False
-    df["entry_price"] = np.nan
-    df["sl_price"] = np.nan
-    df["tp_price"] = np.nan
-    df["exit_type"] = ""
-    df["exit_bar"] = pd.Series(pd.NaT, index=df.index, dtype="datetime64[ms, UTC]")
-    df["exit_price"] = np.nan
-    df["trade_pnl_pips"] = np.nan
-
-    pip = 0.01  # USDJPY
+    sell_setups = []
+    buy_setups = []
+    day_ranges = []  # for build_chart()
 
     uk_dates = df["uk_date"].unique()
 
     for uk_day in uk_dates:
         day_mask = df["uk_date"] == uk_day
 
-        # Range bars: hours 00..06 UK
+        # Range bars: 00:00-06:59 UK
         range_mask = (
             day_mask
-            & (df["uk_hour"] >= RANGE_START_HOUR)
-            & (df["uk_hour"] < RANGE_END_HOUR)
+            & (df["uk_hour"] >= range_start_hour)
+            & (df["uk_hour"] < range_end_hour)
         )
         if range_mask.sum() == 0:
             continue
@@ -125,29 +190,38 @@ def calculate_signals(df: pd.DataFrame) -> pd.DataFrame:
         r_high = df.loc[range_mask, "high"].max()
         r_low = df.loc[range_mask, "low"].min()
 
-        # Broadcast range levels onto all post-07:00 bars of the same day
-        # (for plotting); we store on every bar so chart shapes can read them
-        df.loc[day_mask, "range_high"] = r_high
-        df.loc[day_mask, "range_low"] = r_low
+        # --- Range width filters ---
+        range_width = r_high - r_low
+        range_width_pips = range_width / PIP_SIZE
 
-        # Trading bars: hours 07..15 UK (16:00 bar is auto-close, not entry)
+        if range_width_pips < min_range_pips:
+            continue  # thin/dead session — no conviction
+
+        if range_width_pips > max_range_pips:
+            continue  # blown-out news day — unreliable breakout
+
+        range_bars = df.index[range_mask]
+        day_ranges.append(
+            {
+                "uk_day": uk_day,
+                "r_high": r_high,
+                "r_low": r_low,
+                "range_start_ts": range_bars[0],
+                "range_end_ts": range_bars[-1],
+            }
+        )
+
+        # Trading bars: 07:00-15:59 UK (one trade per day max)
         trade_mask = (
             day_mask
-            & (df["uk_hour"] >= RANGE_END_HOUR)
-            & (df["uk_hour"] < TRADE_CLOSE_HOUR)
+            & (df["uk_hour"] >= range_end_hour)
+            & (df["uk_hour"] < trade_close_hour)
         )
         trade_bars = df.index[trade_mask]
 
-        trade_taken = False
-
         for ts in trade_bars:
-            if trade_taken:
-                break
-
             bar = df.loc[ts]
             c = bar["close"]
-            h = bar["high"]
-            l = bar["low"]
 
             is_long = c > r_high
             is_short = c < r_low
@@ -155,89 +229,41 @@ def calculate_signals(df: pd.DataFrame) -> pd.DataFrame:
             if not is_long and not is_short:
                 continue
 
-            # --- Entry ---
             direction = "long" if is_long else "short"
             entry = c
             sl = r_low if direction == "long" else r_high
-            sl_dist = abs(entry - sl)
+
+            # Floor SL distance at full range width — prevents oversized lots
+            # when the entry is only a few pips beyond the boundary.
+            sl_dist = max(abs(entry - sl), range_width)
 
             if sl_dist <= 0:
-                continue
+                break  # degenerate day — skip remaining bars
 
-            tp = entry + RR * sl_dist if direction == "long" else entry - RR * sl_dist
-
-            df.loc[ts, "buy_signal"] = direction == "long"
-            df.loc[ts, "sell_signal"] = direction == "short"
-            df.loc[ts, "entry_price"] = entry
-            df.loc[ts, "sl_price"] = sl
-            df.loc[ts, "tp_price"] = tp
-            trade_taken = True
-
-            # --- Simulate forward to find exit ---
-            # Bars from the next bar until 16:00 UK on the same day
-            post_mask = day_mask & (df.index > ts) & (df["uk_hour"] <= TRADE_CLOSE_HOUR)
-            post_bars = df.index[post_mask]
-
-            exit_type = "time"
-            exit_ts = None
-            exit_px = None
-
-            for future_ts in post_bars:
-                fb = df.loc[future_ts]
-                fh = fb["high"]
-                fl = fb["low"]
-                fc = fb["close"]
-                fhour = fb["uk_hour"]
-
-                # Time exit at 16:00 bar close (regardless of TP/SL on that bar)
-                if fhour == TRADE_CLOSE_HOUR:
-                    exit_type = "time"
-                    exit_ts = future_ts
-                    exit_px = fc
-                    break
-
-                if direction == "long":
-                    # SL hit first (conservative: check SL before TP within bar)
-                    if fl <= sl:
-                        exit_type = "sl"
-                        exit_ts = future_ts
-                        exit_px = sl
-                        break
-                    if fh >= tp:
-                        exit_type = "tp"
-                        exit_ts = future_ts
-                        exit_px = tp
-                        break
-                else:  # short
-                    if fh >= sl:
-                        exit_type = "sl"
-                        exit_ts = future_ts
-                        exit_px = sl
-                        break
-                    if fl <= tp:
-                        exit_type = "tp"
-                        exit_ts = future_ts
-                        exit_px = tp
-                        break
-
-            # If no forward bars found (e.g. data ends), mark as time exit on entry bar
-            if exit_ts is None:
-                exit_type = "time"
-                exit_ts = ts
-                exit_px = entry
-
-            pnl_pips = (
-                (exit_px - entry) / pip
+            tp = (
+                entry + risk_reward * sl_dist
                 if direction == "long"
-                else (entry - exit_px) / pip
+                else entry - risk_reward * sl_dist
             )
 
-            df.loc[ts, "exit_type"] = exit_type
-            df.loc[ts, "exit_bar"] = exit_ts
-            df.loc[ts, "exit_price"] = exit_px
-            df.loc[ts, "trade_pnl_pips"] = pnl_pips
+            setup = {
+                "entry_ts": ts,
+                "entry": entry,
+                "sl": sl,
+                "tp": tp,
+                "range_high": r_high,
+                "range_low": r_low,
+                "direction": direction,
+            }
 
-    return df
+            if direction == "long":
+                buy_setups.append(setup)
+            else:
+                sell_setups.append(setup)
+
+            break  # one trade per day
+
+    return sell_setups, buy_setups, {"day_ranges": day_ranges}
 
 
 # ---------------------------------------------------------------------------
@@ -245,26 +271,30 @@ def calculate_signals(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 
-def build_chart(df: pd.DataFrame, symbol: str, start: str, end: str) -> go.Figure:
+def build_chart(
+    df: pd.DataFrame,
+    sell_setups: list,
+    buy_setups: list,
+    extra: dict = None,
+    symbol: str = SYMBOL,
+    timezone: str = TIMEZONE,
+) -> go.Figure:
     """
-    Build a single Plotly candlestick figure for the full date window.
+    Build a single Plotly candlestick figure showing range zones and trade markers.
 
     Includes:
       - Candlestick OHLC
-      - Daily range shaded rectangles (grey, behind candles)
-      - Range High / Range Low dashed horizontal lines per day
+      - Daily Asian range shaded rectangles
+      - Range High / Range Low dashed lines
       - BUY / SELL entry markers
-      - TP / SL / Time-exit markers
+      - TP / SL / Time-exit markers  (simulated forward scan)
+      - Trade connector lines
       - Volume subplot
     """
-    # Slice to requested window
-    mask = (df.index >= pd.Timestamp(start, tz="UTC")) & (
-        df.index <= pd.Timestamp(end, tz="UTC")
-    )
-    d = df[mask].copy()
+    if extra is None:
+        extra = {}
 
-    if len(d) == 0:
-        raise ValueError(f"No data between {start} and {end}")
+    day_ranges = extra.get("day_ranges", [])
 
     fig = make_subplots(
         rows=2,
@@ -278,11 +308,11 @@ def build_chart(df: pd.DataFrame, symbol: str, start: str, end: str) -> go.Figur
     # --- Candlesticks ---
     fig.add_trace(
         go.Candlestick(
-            x=d.index,
-            open=d["open"],
-            high=d["high"],
-            low=d["low"],
-            close=d["close"],
+            x=df.index,
+            open=df["open"],
+            high=df["high"],
+            low=df["low"],
+            close=df["close"],
             name="OHLC",
             increasing_line_color="#26a69a",
             increasing_fillcolor="#26a69a",
@@ -296,12 +326,12 @@ def build_chart(df: pd.DataFrame, symbol: str, start: str, end: str) -> go.Figur
 
     # --- Volume ---
     vol_colors = [
-        "#26a69a" if c >= o else "#ef5350" for c, o in zip(d["close"], d["open"])
+        "#26a69a" if c >= o else "#ef5350" for c, o in zip(df["close"], df["open"])
     ]
     fig.add_trace(
         go.Bar(
-            x=d.index,
-            y=d["volume"],
+            x=df.index,
+            y=df["volume"],
             name="Volume",
             marker_color=vol_colors,
             opacity=0.5,
@@ -311,41 +341,33 @@ def build_chart(df: pd.DataFrame, symbol: str, start: str, end: str) -> go.Figur
         col=1,
     )
 
-    # --- Per-day range shapes & level lines ---
+    # --- Per-day range shapes ---
     shapes = []
-    range_high_x, range_high_y = [], []
-    range_low_x, range_low_y = [], []
 
-    uk_dates = d["uk_date"].unique()
+    # Re-derive UK hours for shape building if not already on df
+    if "uk_hour" not in df.columns:
+        df_utc = df.copy()
+        df_utc.index = df_utc.index.tz_localize("UTC")
+        df_uk = df_utc.tz_convert(timezone)
+        df["uk_hour"] = df_uk.index.hour
 
-    for uk_day in uk_dates:
-        day_mask = d["uk_date"] == uk_day
-        day_bars = d[day_mask]
+    for dr in day_ranges:
+        r_high = dr["r_high"]
+        r_low = dr["r_low"]
+        x0 = dr["range_start_ts"]
+        x1 = dr["range_end_ts"] + pd.Timedelta(hours=1)
 
-        r_high = (
-            day_bars["range_high"].dropna().iloc[0]
-            if day_bars["range_high"].notna().any()
-            else None
+        # Find end of trading day to extend the level lines
+        day_bars = df[df.index.date == pd.Timestamp(dr["uk_day"]).date()]
+        close_bars = day_bars[day_bars["uk_hour"] == TRADE_CLOSE_HOUR]
+        x_end = (
+            close_bars.index[-1] + pd.Timedelta(hours=1)
+            if len(close_bars) > 0
+            else (
+                day_bars.index[-1] + pd.Timedelta(hours=1) if len(day_bars) > 0 else x1
+            )
         )
-        r_low = (
-            day_bars["range_low"].dropna().iloc[0]
-            if day_bars["range_low"].notna().any()
-            else None
-        )
-
-        if r_high is None or r_low is None:
-            continue
-
-        # Range bars (00:00–06:00) x-span for the shaded box
-        range_bars = day_bars[
-            (day_bars["uk_hour"] >= RANGE_START_HOUR)
-            & (day_bars["uk_hour"] < RANGE_END_HOUR)
-        ]
-        if len(range_bars) == 0:
-            continue
-
-        x0 = range_bars.index[0]
-        x1 = range_bars.index[-1] + pd.Timedelta(hours=1)
+        x_start = day_bars.index[0] if len(day_bars) > 0 else x0
 
         # Shaded accumulation zone
         shapes.append(
@@ -363,17 +385,7 @@ def build_chart(df: pd.DataFrame, symbol: str, start: str, end: str) -> go.Figur
             )
         )
 
-        # Range High dashed line across full trading day
-        all_day_bars = day_bars
-        x_start = all_day_bars.index[0]
-        # Extend line to 16:00 UK bar
-        close_bars = day_bars[day_bars["uk_hour"] == TRADE_CLOSE_HOUR]
-        x_end = (
-            close_bars.index[-1] + pd.Timedelta(hours=1)
-            if len(close_bars) > 0
-            else all_day_bars.index[-1] + pd.Timedelta(hours=1)
-        )
-
+        # Range High dashed line
         shapes.append(
             dict(
                 type="line",
@@ -387,6 +399,8 @@ def build_chart(df: pd.DataFrame, symbol: str, start: str, end: str) -> go.Figur
                 layer="below",
             )
         )
+
+        # Range Low dashed line
         shapes.append(
             dict(
                 type="line",
@@ -402,14 +416,18 @@ def build_chart(df: pd.DataFrame, symbol: str, start: str, end: str) -> go.Figur
         )
 
     # --- Entry markers ---
-    buy_bars = d[d["buy_signal"]]
-    sell_bars = d[d["sell_signal"]]
+    all_setups = [(s, "short") for s in sell_setups] + [(s, "long") for s in buy_setups]
 
-    if len(buy_bars) > 0:
+    buy_x = [s["entry_ts"] for s, d in all_setups if d == "long"]
+    buy_y = [s["entry"] for s, d in all_setups if d == "long"]
+    sell_x = [s["entry_ts"] for s, d in all_setups if d == "short"]
+    sell_y = [s["entry"] for s, d in all_setups if d == "short"]
+
+    if buy_x:
         fig.add_trace(
             go.Scatter(
-                x=buy_bars.index,
-                y=buy_bars["entry_price"],
+                x=buy_x,
+                y=buy_y,
                 mode="markers",
                 name="BUY Entry",
                 marker=dict(
@@ -423,11 +441,11 @@ def build_chart(df: pd.DataFrame, symbol: str, start: str, end: str) -> go.Figur
             col=1,
         )
 
-    if len(sell_bars) > 0:
+    if sell_x:
         fig.add_trace(
             go.Scatter(
-                x=sell_bars.index,
-                y=sell_bars["entry_price"],
+                x=sell_x,
+                y=sell_y,
                 mode="markers",
                 name="SELL Entry",
                 marker=dict(
@@ -441,36 +459,117 @@ def build_chart(df: pd.DataFrame, symbol: str, start: str, end: str) -> go.Figur
             col=1,
         )
 
-    # --- Exit markers (TP / SL / Time) — plot on the exit bar ---
-    all_trades = d[d["buy_signal"] | d["sell_signal"]].copy()
+    # --- Exit markers (simulated forward scan for charting purposes) ---
+    # Re-attach UK hour for exit scan
+    if "uk_hour" not in df.columns:
+        df_utc2 = df.copy()
+        df_utc2.index = df_utc2.index.tz_localize("UTC")
+        df_uk2 = df_utc2.tz_convert(timezone)
+        df["uk_hour"] = df_uk2.index.hour
 
-    tp_exit_x, tp_exit_y = [], []
-    sl_exit_x, sl_exit_y = [], []
-    time_exit_x, time_exit_y = [], []
+    if "uk_date" not in df.columns:
+        df_utc3 = df.copy()
+        df_utc3.index = df_utc3.index.tz_localize("UTC")
+        df_uk3 = df_utc3.tz_convert(timezone)
+        df["uk_date"] = df_uk3.index.normalize().tz_localize(None)
 
-    for _, row in all_trades.iterrows():
-        exit_ts = row["exit_bar"]
-        exit_px = row["exit_price"]
-        etype = row["exit_type"]
+    tp_x, tp_y = [], []
+    sl_x, sl_y = [], []
+    time_x, time_y = [], []
 
-        if pd.isna(exit_ts) or pd.isna(exit_px):
+    for setup, direction in all_setups:
+        ts = setup["entry_ts"]
+        entry = setup["entry"]
+        sl_px = setup["sl"]
+        tp_px = setup["tp"]
+        uk_day = df.loc[ts, "uk_date"] if ts in df.index else None
+
+        if uk_day is None:
             continue
 
-        if etype == "tp":
-            tp_exit_x.append(exit_ts)
-            tp_exit_y.append(exit_px)
-        elif etype == "sl":
-            sl_exit_x.append(exit_ts)
-            sl_exit_y.append(exit_px)
-        else:
-            time_exit_x.append(exit_ts)
-            time_exit_y.append(exit_px)
+        day_mask = df["uk_date"] == uk_day
+        post_mask = day_mask & (df.index > ts) & (df["uk_hour"] <= TRADE_CLOSE_HOUR)
+        post_bars = df.index[post_mask]
 
-    if tp_exit_x:
+        exit_ts = None
+        exit_px = None
+        exit_type = "time"
+
+        for future_ts in post_bars:
+            fb = df.loc[future_ts]
+            fh = fb["high"]
+            fl = fb["low"]
+            fc = fb["close"]
+            fhour = fb["uk_hour"]
+
+            if fhour == TRADE_CLOSE_HOUR:
+                exit_type = "time"
+                exit_ts = future_ts
+                exit_px = fc
+                break
+
+            if direction == "long":
+                if fl <= sl_px:
+                    exit_type = "sl"
+                    exit_ts = future_ts
+                    exit_px = sl_px
+                    break
+                if fh >= tp_px:
+                    exit_type = "tp"
+                    exit_ts = future_ts
+                    exit_px = tp_px
+                    break
+            else:
+                if fh >= sl_px:
+                    exit_type = "sl"
+                    exit_ts = future_ts
+                    exit_px = sl_px
+                    break
+                if fl <= tp_px:
+                    exit_type = "tp"
+                    exit_ts = future_ts
+                    exit_px = tp_px
+                    break
+
+        if exit_ts is None:
+            exit_type = "time"
+            exit_ts = ts
+            exit_px = entry
+
+        if exit_type == "tp":
+            tp_x.append(exit_ts)
+            tp_y.append(exit_px)
+        elif exit_type == "sl":
+            sl_x.append(exit_ts)
+            sl_y.append(exit_px)
+        else:
+            time_x.append(exit_ts)
+            time_y.append(exit_px)
+
+        # Connector line
+        color = (
+            "#ffeb3b"
+            if exit_type == "tp"
+            else ("#ff5252" if exit_type == "sl" else "#b0bec5")
+        )
         fig.add_trace(
             go.Scatter(
-                x=tp_exit_x,
-                y=tp_exit_y,
+                x=[ts, exit_ts],
+                y=[entry, exit_px],
+                mode="lines",
+                line=dict(color=color, width=1, dash="dot"),
+                showlegend=False,
+                hoverinfo="skip",
+            ),
+            row=1,
+            col=1,
+        )
+
+    if tp_x:
+        fig.add_trace(
+            go.Scatter(
+                x=tp_x,
+                y=tp_y,
                 mode="markers",
                 name="TP Hit",
                 marker=dict(
@@ -484,11 +583,11 @@ def build_chart(df: pd.DataFrame, symbol: str, start: str, end: str) -> go.Figur
             col=1,
         )
 
-    if sl_exit_x:
+    if sl_x:
         fig.add_trace(
             go.Scatter(
-                x=sl_exit_x,
-                y=sl_exit_y,
+                x=sl_x,
+                y=sl_y,
                 mode="markers",
                 name="SL Hit",
                 marker=dict(
@@ -502,11 +601,11 @@ def build_chart(df: pd.DataFrame, symbol: str, start: str, end: str) -> go.Figur
             col=1,
         )
 
-    if time_exit_x:
+    if time_x:
         fig.add_trace(
             go.Scatter(
-                x=time_exit_x,
-                y=time_exit_y,
+                x=time_x,
+                y=time_y,
                 mode="markers",
                 name="Time Exit (16:00)",
                 marker=dict(
@@ -520,41 +619,11 @@ def build_chart(df: pd.DataFrame, symbol: str, start: str, end: str) -> go.Figur
             col=1,
         )
 
-    # --- Trade connector lines (entry → exit) ---
-    for _, row in all_trades.iterrows():
-        exit_ts = row["exit_bar"]
-        exit_px = row["exit_price"]
-        entry_ts = row.name
-        entry_px = row["entry_price"]
-
-        if pd.isna(exit_ts) or pd.isna(exit_px):
-            continue
-
-        etype = row["exit_type"]
-        color = (
-            "#ffeb3b" if etype == "tp" else ("#ff5252" if etype == "sl" else "#b0bec5")
-        )
-
-        fig.add_trace(
-            go.Scatter(
-                x=[entry_ts, exit_ts],
-                y=[entry_px, exit_px],
-                mode="lines",
-                line=dict(color=color, width=1, dash="dot"),
-                showlegend=False,
-                hoverinfo="skip",
-            ),
-            row=1,
-            col=1,
-        )
-
-    # --- Stats annotation ---
-    trade_rows = d[d["buy_signal"] | d["sell_signal"]]
-    n_trades = len(trade_rows)
-    n_tp = (trade_rows["exit_type"] == "tp").sum()
-    n_sl = (trade_rows["exit_type"] == "sl").sum()
-    n_time = (trade_rows["exit_type"] == "time").sum()
-    total_pips = trade_rows["trade_pnl_pips"].sum()
+    # --- Summary stats for title ---
+    n_trades = len(all_setups)
+    n_tp = len(tp_x)
+    n_sl = len(sl_x)
+    n_time = len(time_x)
     win_rate = (n_tp / n_trades * 100) if n_trades > 0 else 0.0
 
     fig.update_layout(
@@ -567,11 +636,9 @@ def build_chart(df: pd.DataFrame, symbol: str, start: str, end: str) -> go.Figur
         shapes=shapes,
         title=dict(
             text=(
-                f"<b>{symbol} 1H — Asian Range Breakout</b>  "
-                f"<sup>{start} to {end}</sup><br>"
+                f"<b>{symbol} 1H — Asian Range Breakout</b><br>"
                 f"<sup>Trades: {n_trades}  |  TP: {n_tp}  |  SL: {n_sl}  |  "
                 f"Time exit: {n_time}  |  Win rate: {win_rate:.1f}%  |  "
-                f"Total P&L: {total_pips:+.1f} pips  |  "
                 f"Grey zone = Asian range  |  "
                 f"<span style='color:#ef5350'>--- Range High</span>  "
                 f"<span style='color:#26a69a'>--- Range Low</span></sup>"
@@ -588,132 +655,29 @@ def build_chart(df: pd.DataFrame, symbol: str, start: str, end: str) -> go.Figur
 
 
 # ---------------------------------------------------------------------------
-# Main experiment runner
+# __main__
 # ---------------------------------------------------------------------------
 
-
-def run_experiment(
-    symbol: str = SYMBOL,
-    start_date: str = START_DATE,
-    end_date: str = END_DATE,
-    show_chart: bool = True,
-    save_outputs: bool = True,
-):
-    print(f"Loading {symbol} 1H data ({start_date} to {end_date})...")
-    loader = DataLoader()
-    # Load without date filter to avoid tz-naive vs tz-aware comparison in data_loader
-    df = loader.load_fx(symbol, timeframe="1h")
-
-    # Ensure UTC-aware index
-    if df.index.tz is None:
-        df.index = df.index.tz_localize("UTC")
-    else:
-        df.index = df.index.tz_convert("UTC")
-
-    # Now slice with tz-aware timestamps
-    df = df[
-        (df.index >= pd.Timestamp(start_date, tz="UTC"))
-        & (df.index <= pd.Timestamp(end_date, tz="UTC"))
-    ]
-
-    print(f"  Loaded {len(df):,} 1H bars  ({df.index.min()} -> {df.index.max()})")
-
-    print("Detecting range breakout signals...")
-    df = calculate_signals(df)
-
-    trade_rows = df[df["buy_signal"] | df["sell_signal"]]
-    n_trades = len(trade_rows)
-    n_long = int(df["buy_signal"].sum())
-    n_short = int(df["sell_signal"].sum())
-    n_tp = (trade_rows["exit_type"] == "tp").sum()
-    n_sl = (trade_rows["exit_type"] == "sl").sum()
-    n_time = (trade_rows["exit_type"] == "time").sum()
-    total_pips = trade_rows["trade_pnl_pips"].sum()
-    win_rate = (n_tp / n_trades * 100) if n_trades > 0 else 0.0
-
-    print(f"  Total trades     : {n_trades}  (long: {n_long}, short: {n_short})")
-    print(f"  TP exits         : {n_tp}")
-    print(f"  SL exits         : {n_sl}")
-    print(f"  Time exits       : {n_time}")
-    print(f"  Win rate         : {win_rate:.1f}%")
-    print(f"  Total P&L        : {total_pips:+.1f} pips")
-
-    # MLflow run
-    run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    reports_dir = Path(__file__).resolve().parent / "reports" / f"{symbol}_{run_ts}"
-    reports_dir.mkdir(parents=True, exist_ok=True)
-
-    mlflow.start_run(run_name=f"{symbol}_1H_{start_date}_{end_date}")
-    mlflow.log_params(
-        {
-            "symbol": symbol,
-            "start_date": start_date,
-            "end_date": end_date,
-            "range_start_hour_uk": RANGE_START_HOUR,
-            "range_end_hour_uk": RANGE_END_HOUR,
-            "trade_close_hour_uk": TRADE_CLOSE_HOUR,
-            "rr": RR,
-            "timezone": TIMEZONE,
-        }
-    )
-    mlflow.log_metrics(
-        {
-            "total_trades": float(n_trades),
-            "n_long": float(n_long),
-            "n_short": float(n_short),
-            "tp_exits": float(n_tp),
-            "sl_exits": float(n_sl),
-            "time_exits": float(n_time),
-            "win_rate_pct": float(win_rate),
-            "total_pnl_pips": float(total_pips),
-        }
-    )
-
-    # Build chart for the full date range
-    print("Building chart...")
-    vbt_settings_ok = True
-    try:
-        import vectorbt as vbt
-
-        vbt.settings.plotting["use_widgets"] = False
-    except ImportError:
-        vbt_settings_ok = False
-
-    fig = build_chart(df, symbol=symbol, start=start_date, end=end_date)
-
-    if save_outputs:
-        chart_path = reports_dir / "rangebo_chart.html"
-        fig.write_html(str(chart_path))
-        print(f"  Chart saved    -> {chart_path}")
-
-        # Trades summary CSV
-        trades_csv = trade_rows[
-            [
-                "entry_price",
-                "sl_price",
-                "tp_price",
-                "exit_type",
-                "exit_bar",
-                "exit_price",
-                "trade_pnl_pips",
-                "buy_signal",
-                "sell_signal",
-            ]
-        ].copy()
-        trades_path = reports_dir / "trades.csv"
-        trades_csv.to_csv(trades_path)
-        print(f"  Trades saved   -> {trades_path}")
-
-        mlflow.log_artifacts(str(reports_dir), artifact_path="outputs")
-        print(f"  MLflow run logged -> {MLFLOW_TRACKING_URI}")
-
-    mlflow.end_run()
-
-    if show_chart:
-        fig.show()
-
-    return df, fig
-
-
 if __name__ == "__main__":
-    run_experiment()
+    import vectorbt as vbt
+
+    vbt.settings.plotting["use_widgets"] = False
+
+    print(f"Loading {SYMBOL} {LOWER_TF} data ({START_DATE} to {END_DATE})...")
+    df = load_ohlcv(SYMBOL, START_DATE, END_DATE, LOWER_TF)
+    print(f"  {len(df):,} bars  [{df.index.min()} -> {df.index.max()}]")
+
+    print("Detecting setups...")
+    sell_setups, buy_setups, extra = detect_setups(df)
+    print(f"  Long  setups : {len(buy_setups)}")
+    print(f"  Short setups : {len(sell_setups)}")
+
+    print("Building chart...")
+    fig = build_chart(df, sell_setups, buy_setups, extra=extra, symbol=SYMBOL)
+
+    reports_dir = Path(__file__).resolve().parent / "reports"
+    reports_dir.mkdir(exist_ok=True)
+    out = reports_dir / f"strategy_{SYMBOL}_{LOWER_TF}.html"
+    fig.write_html(str(out))
+    print(f"  Chart saved -> {out}")
+    fig.show()

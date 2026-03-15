@@ -229,7 +229,7 @@ TELEGRAM_CHAT_ID = _optional("TELEGRAM_CHAT_ID")
 MT5_PATH = r"C:\Program Files\MetaTrader 5\terminal64.exe"  # e.g. r"C:\Program Files\MetaTrader 5 ICMarkets\terminal64.exe"
 
 # Strategy — fixed constants (not user-configurable via .env)
-SYMBOL = "USDJPY.pro"
+SYMBOL = "USDJPY"
 TIMEZONE = "Europe/London"
 RANGE_START_HOUR = 0  # 00:00 UK inclusive
 RANGE_END_HOUR = 7  # 07:00 UK exclusive
