@@ -78,7 +78,7 @@ _DUKASCOPY_DIR = (
 )
 DUKASCOPY_FILES = {}
 if _DUKASCOPY_DIR.exists():
-    for f in _DUKASCOPY_DIR.glob("*_dukascopy_*.parquet"):
+    for f in _DUKASCOPY_DIR.glob("**/*_dukascopy_*.parquet"):
         # Extract symbol from filename: e.g., "gbpusd_dukascopy_1h.parquet" -> "GBPUSD"
         symbol_from_file = f.stem.split("_dukascopy")[0].upper()
         DUKASCOPY_FILES[symbol_from_file] = f

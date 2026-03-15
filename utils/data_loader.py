@@ -57,7 +57,9 @@ class DataLoader:
         Returns:
             DataFrame with OHLCV data, indexed by timestamp
         """
-        filepath = self.fx_dir / f"{symbol.lower()}_{timeframe}.parquet"
+        filepath = (
+            self.fx_dir / symbol.lower() / f"{symbol.lower()}_{timeframe}.parquet"
+        )
         return self._load_and_filter(filepath, start_date, end_date)
 
     def load_index(
@@ -79,7 +81,9 @@ class DataLoader:
         Returns:
             DataFrame with OHLCV data, indexed by timestamp
         """
-        filepath = self.indices_dir / f"{symbol.lower()}_{timeframe}.parquet"
+        filepath = (
+            self.indices_dir / symbol.lower() / f"{symbol.lower()}_{timeframe}.parquet"
+        )
         return self._load_and_filter(filepath, start_date, end_date)
 
     def load_multiple(
@@ -141,6 +145,11 @@ class DataLoader:
             df["timestamp"] = pd.to_datetime(df["timestamp"])
             df.set_index("timestamp", inplace=True)
 
+        # Strip timezone so all data is tz-naive (broker server time or UTC
+        # stripped to naive — callers handle tz semantics themselves)
+        if df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
+
         # Filter by date range if specified
         if start_date is not None:
             df = df[df.index >= pd.to_datetime(start_date)]
@@ -163,11 +172,10 @@ class DataLoader:
         if not directory.exists():
             return []
 
-        symbols = []
-        for file in directory.glob("*.parquet"):
-            # Extract symbol from filename (e.g., 'eurusd_1m.parquet' -> 'EURUSD')
-            symbol = file.stem.split("_")[0].upper()
-            symbols.append(symbol)
+        symbols = set()
+        for file in directory.glob("*/*.parquet"):
+            # Parent directory name is the symbol (e.g., fx/eurusd/ -> EURUSD)
+            symbols.add(file.parent.name.upper())
 
         return sorted(symbols)
 
@@ -221,7 +229,7 @@ class DataLoader:
             df = load_func(symbol)
 
             directory = self.fx_dir if asset_type == "fx" else self.indices_dir
-            filepath = directory / f"{symbol.lower()}_1m.parquet"
+            filepath = directory / symbol.lower() / f"{symbol.lower()}_1m.parquet"
             file_size_mb = filepath.stat().st_size / (1024 * 1024)
 
             return {

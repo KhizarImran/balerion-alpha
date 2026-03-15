@@ -157,7 +157,7 @@ def build_equity_chart(
                 f"Sharpe: {pf.sharpe_ratio():.2f}  |  "
                 f"Win Rate: {win_rate:.1f}%  |  "
                 f"Trades: {total_trades}  |  "
-                f"Max DD: {pf.max_drawdown() * 100:.2f}%</sup>"
+                f"Max DD: {dd.min():.2f}%</sup>"
             ),
             x=0.5,
             xanchor="center",
@@ -486,7 +486,7 @@ def build_analytics_chart(
                 f"Sortino: {pf.sortino_ratio():.2f}  |  "
                 f"Win Rate: {win_rate:.1f}%  |  "
                 f"Trades: {total_trades}  |  "
-                f"Max DD: {pf.max_drawdown() * 100:.2f}%  |  "
+                f"Max DD: {dd.min():.2f}%  |  "
                 f"Profit Factor: {pf.trades.profit_factor():.2f}"
                 f"</sup>"
             ),

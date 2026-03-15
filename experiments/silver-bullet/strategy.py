@@ -1,408 +1,920 @@
 """
-ICT Silver Bullet Strategy — Signal Generation & Visualization
+ICT Silver Bullet Strategy — Signal Generation & Visualisation
 
-Strategy Logic:
-  - Asset:      US30 (Dow Jones), 1-minute data
-  - Sessions:   Three ICT killzone windows (all times EST):
-                  London       03:00 – 04:00
-                  New York AM  10:00 – 11:00
-                  New York PM  14:00 – 15:00
-  - Structure:
-      1. Liquidity sweep: a 240-bar low has been swept (low_swept),
-         but a 240-bar high has NOT yet been swept (bullish bias).
-      2. Bullish FVG (Fair Value Gap): candle N-2 high < candle N low,
-         creating an imbalance that price pulls back into.
-      3. Entry: price retraces into the FVG zone during any session window.
-      4. One entry per session per trading day (first qualifying bar wins).
-  - Stop Loss:  Below the swept liquidity low minus a 1-point buffer.
-  - Take Profit: 2:1 Risk/Reward ratio (TP distance = 2 × SL distance).
-  - Time Exit:  52-bar fallback if neither SL nor TP is hit.
-  - Session Cap: Stop trading a session once cumulative loss exceeds -$2,000.
+Strategy:
+  Asset:    US30 (Dow Jones), 1-minute data
+  Sessions: Three ICT killzone windows (Eastern Time):
+              London       03:00 - 03:59 ET
+              New York AM  10:00 - 10:59 ET
+              New York PM  14:00 - 14:59 ET
+
+  Long entry conditions (all must be true):
+    1. A rolling `liquidity_window`-bar LOW has been swept within the last
+       `sweep_lookback` bars (bullish bias — stops below were hunted).
+    2. The corresponding HIGH has NOT been swept (bias intact).
+    3. A bullish FVG exists: high[N-2] < low[N] (two-bar upward imbalance).
+    4. Price pulls back inside the FVG zone within `pullback_window` bars.
+    5. Bar falls within one of the three killzone windows.
+
+  Short entry conditions (mirror of long, inverted):
+    1. A rolling `liquidity_window`-bar HIGH has been swept.
+    2. The corresponding LOW has NOT been swept (bearish bias intact).
+    3. A bearish FVG exists: low[N-2] > high[N] (two-bar downward imbalance).
+    4. Price pulls back inside the bearish FVG zone within `pullback_window` bars.
+    5. Bar falls within one of the three killzone windows.
+
+  One entry per session per calendar day (first qualifying bar wins).
+  A per-session cumulative loss cap (`session_cap_usd`) halts further
+  entries in a session once the estimated loss exceeds the threshold.
+
+  Stop Loss:   Long  — below swept liquidity low minus `sl_buffer_pts`
+               Short — above swept liquidity high plus `sl_buffer_pts`
+  Take Profit: `rr_ratio` x SL distance (long: above entry, short: below)
+  Time exit:   52 bars if neither SL nor TP is hit.
 """
 
+import os
 import sys
+import io
 from pathlib import Path
 
 project_root = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(project_root))
 
-import pandas as pd
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+os.environ["SMC_CREDIT"] = "0"
+
 import numpy as np
-from utils import load_data, plot_candlestick_with_signals
+import pandas as pd
+import pytz
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+from utils import DataLoader
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+SYMBOL = "US30"
+START_DATE = "2025-11-11"
+END_DATE = "2026-02-25"
+TIMEFRAME = "1min"
+
+LIQUIDITY_WINDOW = 150  # rolling window (bars) for significant high/low levels
+SWEEP_LOOKBACK = 50  # bars to look back for sweep detection
+PULLBACK_WINDOW = 10  # bars the FVG zone stays alive for pullback entry
+RR_RATIO = 2.0  # take profit = RR_RATIO x SL distance
+SL_BUFFER_PTS = 0.0  # extra points beyond liquidity level for SL
+SESSION_CAP_USD = -5_500.0  # max cumulative estimated loss per session per day
+
+LOT_SIZE = 10  # lots per trade — used only for session cap estimation
 
 
 # ---------------------------------------------------------------------------
-# Signal Calculation
+# Data loading
 # ---------------------------------------------------------------------------
 
 
-def calculate_signals(
-    df: pd.DataFrame,
-    liquidity_window: int = 240,
-    sweep_lookback: int = 120,
-    pullback_window: int = 15,
-    rr_ratio: float = 2.0,
-    sl_buffer_pts: float = 1.0,
-    session_cap_usd: float = -2_000.0,
-    lot_size: int = 10,
-) -> pd.DataFrame:
+def load_ohlcv(
+    symbol: str = SYMBOL,
+    start: str = START_DATE,
+    end: str = END_DATE,
+    tf: str = TIMEFRAME,
+) -> tuple:
     """
-    Calculate ICT Silver Bullet entry signals across three sessions.
+    Load OHLCV data for an index symbol, preferring Dukascopy data where
+    available and falling back to MT5 data otherwise.
 
-    Sessions (all New York / Eastern time):
-      - London      : 03:00 – 03:59 ET
-      - New York AM : 10:00 – 10:59 ET
-      - New York PM : 14:00 – 14:59 ET
+    Resolution order for 1-minute data:
+      1. {symbol}_dukascopy_1m.parquet  — Dukascopy tick-aggregated 1m (preferred,
+         timestamps are UTC)
+      2. {symbol}_1m.parquet            — MT5 1-minute (fallback, timestamps are
+         Europe/Athens broker server time)
 
-    One entry is allowed per session per calendar day, subject to the
-    session P&L cap.  A qualifying bar must:
-      1. Have lows swept (bullish liquidity bias).
-      2. Have highs NOT swept (bullish bias confirmed).
-      3. Close inside an active bullish FVG zone.
-      4. Fall within one of the three session windows.
-      5. The session's cumulative estimated P&L has not hit session_cap_usd.
-
-    Timezone note — broker server time:
-      The MT5 data timestamps are in broker server time, which is UTC+2 in
-      winter (EET) and UTC+3 in summer (EEST).  Eastern Time is UTC-5 in
-      winter (EST) and UTC-4 in summer (EDT).
-
-      To convert broker server time -> ET we use pytz so that DST transitions
-      in both the EU and the US are handled automatically:
-
-        server (naive) -> assume UTC+2/+3 via 'Europe/Athens'
-        then convert   -> 'America/New_York'
-
-      Flat-offset summary for reference:
-        Period                     EU tz    ET tz   Server -> ET offset
-        Nov–Mar (both on winter)   UTC+2    UTC-5   subtract 7 h
-        Mar–Oct (both on summer)   UTC+3    UTC-4   subtract 7 h
-        Late Mar gap (EU summer,   UTC+3    UTC-5   subtract 8 h
-          US still winter)
-        Early Nov gap (EU winter,  UTC+2    UTC-4   subtract 6 h
-          US still summer)
-
-    Args:
-        df:                  OHLCV DataFrame with naive datetime index in
-                             broker server time (UTC+2 winter / UTC+3 summer).
-        liquidity_window:    Rolling window (bars) for defining significant
-                             highs/lows (default 240 = 4 hours on 1-min data).
-        sweep_lookback:      Bars to look back when detecting whether a
-                             liquidity level has been swept (default 120 = 2 h).
-        pullback_window:     How many bars the FVG zone is kept alive for a
-                             pullback entry (default 15 minutes).
-        rr_ratio:            Take-profit = rr_ratio × SL distance (default 2.0).
-        sl_buffer_pts:       Extra points below the swept liquidity low for the
-                             stop loss (default 1.0 point).
-        session_cap_usd:     Maximum cumulative loss per session per day in $.
-                             Once hit, no further entries are taken in that
-                             session for the rest of that day (default -2000).
-        lot_size:            Lot size used for session cap estimation — must
-                             match the lot size used in the backtest (default 10).
+    For non-1m timeframes the MT5 file is loaded and resampled.
 
     Returns:
-        DataFrame with extra columns:
-          - liquidity_high / liquidity_low    : rolling extremes
-          - bullish_fvg                       : True on the bar the gap forms
-          - bullish_fvg_top/_bottom           : price levels of the gap
-          - low_swept / high_swept            : liquidity sweep flags
-          - in_bullish_fvg                    : price inside the gap zone
-          - in_london / in_ny_am / in_ny_pm   : per-session window flags
-          - in_session                        : True in any of the three windows
-          - session_label                     : 'london' | 'ny_am' | 'ny_pm' | ''
-          - buy_signal                        : raw entry signals (all qualifying bars)
-          - buy_signal_daily                  : one entry per session per day
-                                                (after session cap applied)
-          - sl_price                          : stop loss price for each entry bar
-          - tp_price                          : take profit price for each entry bar
-          - sl_stop_frac                      : SL as fraction of entry price
-                                                (for vectorbt sl_stop parameter)
-          - tp_stop_frac                      : TP as fraction of entry price
-                                                (for vectorbt tp_stop parameter)
-          - sell_signal                       : 52-bar fallback time exit
+        (df, source_tz) where source_tz is 'utc' or 'athens' — passed through
+        to detect_setups() so the session filter uses the correct conversion.
     """
-    df = df.copy()
+    loader = DataLoader()
 
-    high = df["high"]
-    low = df["low"]
-    close = df["close"]
+    if tf in ("1min", "1m"):
+        # Try Dukascopy 1m first (UTC timestamps)
+        try:
+            df = loader.load_index(
+                symbol, start_date=start, end_date=end, timeframe="dukascopy_1m"
+            )
+            return df, "utc"
+        except FileNotFoundError:
+            pass
+        # Fallback: MT5 1m (Athens server time)
+        df = loader.load_index(symbol, start_date=start, end_date=end, timeframe="1m")
+        return df, "athens"
+
+    # Non-1m: load MT5 1m and resample (Athens server time)
+    df = loader.load_index(symbol, start_date=start, end_date=end, timeframe="1m")
+    return loader.resample_ohlcv(df, tf), "athens"
+
+
+# ---------------------------------------------------------------------------
+# Session helpers
+# ---------------------------------------------------------------------------
+
+_ATHENS_TZ = pytz.timezone("Europe/Athens")  # MT5 broker server: UTC+2 / UTC+3
+_UTC_TZ = pytz.timezone("UTC")  # Dukascopy timestamps are UTC
+_EASTERN_TZ = pytz.timezone("America/New_York")
+
+_KILLZONE_HOURS_ET = {3, 10, 14}  # London 03, NY AM 10, NY PM 14
+
+_SESSION_NAMES = {3: "london", 10: "ny_am", 14: "ny_pm"}
+
+
+def _get_et_hours(index: pd.DatetimeIndex, source_tz: str = "utc") -> np.ndarray:
+    """
+    Convert a naive DatetimeIndex to Eastern Time hours.
+
+    Args:
+        index:     Timezone-naive DatetimeIndex.
+        source_tz: 'utc'    — Dukascopy data (timestamps are UTC)
+                   'athens' — MT5 broker server time (Europe/Athens)
+    """
+    tz = _UTC_TZ if source_tz == "utc" else _ATHENS_TZ
+    localised = index.tz_localize(tz, ambiguous="infer", nonexistent="shift_forward")
+    eastern_idx = localised.tz_convert(_EASTERN_TZ)
+    return eastern_idx.hour.to_numpy()
+
+
+# ---------------------------------------------------------------------------
+# Core signal detection
+# ---------------------------------------------------------------------------
+
+
+def detect_setups(
+    df: pd.DataFrame,
+    liquidity_window: int = LIQUIDITY_WINDOW,
+    sweep_lookback: int = SWEEP_LOOKBACK,
+    pullback_window: int = PULLBACK_WINDOW,
+    rr_ratio: float = RR_RATIO,
+    sl_buffer_pts: float = SL_BUFFER_PTS,
+    session_cap_usd: float = SESSION_CAP_USD,
+    lot_size: int = LOT_SIZE,
+    source_tz: str = "utc",
+) -> tuple[list, list, list]:
+    """
+    Detect ICT Silver Bullet long and short setups.
+
+    Args:
+        df:               OHLCV DataFrame with naive DatetimeIndex in broker
+                          server time (Europe/Athens).
+        liquidity_window: Rolling window (bars) for significant high/low levels.
+        sweep_lookback:   Bars to look back for sweep detection.
+        pullback_window:  Bars the FVG zone stays alive for pullback entry.
+        rr_ratio:         Take profit = rr_ratio x SL distance.
+        sl_buffer_pts:    Extra points beyond liquidity level for SL.
+        session_cap_usd:  Max cumulative estimated loss per session per day.
+        lot_size:         Lots per trade (for session cap estimation).
+
+    Returns:
+        (sell_setups, buy_setups, [])
+        sell_setups and buy_setups are lists of dicts with keys:
+            entry_ts   : pd.Timestamp   — index label of entry bar
+            entry      : float          — entry price (close of entry bar)
+            sl         : float          — stop loss price
+            tp         : float          — take profit price
+            direction  : str            — 'long' or 'short'
+            session    : str            — 'london' | 'ny_am' | 'ny_pm'
+            sl_dist    : float          — absolute SL distance in points
+        The third element is an empty list (no HTF FVG filter for this strategy).
+    """
+    high = df["high"].to_numpy()
+    low = df["low"].to_numpy()
+    close = df["close"].to_numpy()
+    idx = df.index
+    n = len(df)
 
     # ------------------------------------------------------------------
-    # 1. Liquidity levels — rolling high/low over liquidity_window bars
+    # 1. Rolling liquidity levels
     # ------------------------------------------------------------------
-    df["liquidity_high"] = high.rolling(window=liquidity_window, min_periods=1).max()
-    df["liquidity_low"] = low.rolling(window=liquidity_window, min_periods=1).min()
+    liq_high = pd.Series(high).rolling(liquidity_window, min_periods=1).max().to_numpy()
+    liq_low = pd.Series(low).rolling(liquidity_window, min_periods=1).min().to_numpy()
 
     # ------------------------------------------------------------------
-    # 2. Liquidity sweep detection
-    #    A level is "swept" if price has touched it at any point in the
-    #    last sweep_lookback bars (rolling max of the boolean touch flag).
+    # 2. Sweep detection
+    #    A level is swept when price touches it within the lookback window.
     # ------------------------------------------------------------------
-    high_touched = high >= df["liquidity_high"]
-    df["high_swept"] = (
-        high_touched.rolling(window=sweep_lookback, min_periods=1).max().astype(bool)
+    high_touched = high >= liq_high
+    low_touched = low <= liq_low
+
+    high_swept = (
+        pd.Series(high_touched.astype(float))
+        .rolling(sweep_lookback, min_periods=1)
+        .max()
+        .astype(bool)
+        .to_numpy()
+    )
+    low_swept = (
+        pd.Series(low_touched.astype(float))
+        .rolling(sweep_lookback, min_periods=1)
+        .max()
+        .astype(bool)
+        .to_numpy()
     )
 
-    low_touched = low <= df["liquidity_low"]
-    df["low_swept"] = (
-        low_touched.rolling(window=sweep_lookback, min_periods=1).max().astype(bool)
+    # ------------------------------------------------------------------
+    # 3. Bullish FVG: high[N-2] < low[N] (two-bar upward imbalance)
+    #    Zone: bottom = high[N-2], top = low[N], labelled on bar N.
+    #    Zone is alive for pullback_window bars from bar N onward.
+    # ------------------------------------------------------------------
+    bull_fvg_top = np.full(n, np.nan)
+    bull_fvg_bot = np.full(n, np.nan)
+    for i in range(2, n):
+        if high[i - 2] < low[i]:
+            bull_fvg_top[i] = low[i]
+            bull_fvg_bot[i] = high[i - 2]
+
+    # Forward-fill each FVG zone for pullback_window bars
+    bull_top_ff = np.full(n, np.nan)
+    bull_bot_ff = np.full(n, np.nan)
+    for i in range(n):
+        if not np.isnan(bull_fvg_top[i]):
+            end = min(n, i + pullback_window + 1)
+            for j in range(i, end):
+                if np.isnan(bull_top_ff[j]):
+                    bull_top_ff[j] = bull_fvg_top[i]
+                    bull_bot_ff[j] = bull_fvg_bot[i]
+
+    # Price inside bullish FVG
+    in_bull_fvg = (close <= bull_top_ff) & (close >= bull_bot_ff)
+
+    # ------------------------------------------------------------------
+    # 4. Bearish FVG: low[N-2] > high[N] (two-bar downward imbalance)
+    #    Zone: top = low[N-2], bottom = high[N], labelled on bar N.
+    # ------------------------------------------------------------------
+    bear_fvg_top = np.full(n, np.nan)
+    bear_fvg_bot = np.full(n, np.nan)
+    for i in range(2, n):
+        if low[i - 2] > high[i]:
+            bear_fvg_top[i] = low[i - 2]
+            bear_fvg_bot[i] = high[i]
+
+    bear_top_ff = np.full(n, np.nan)
+    bear_bot_ff = np.full(n, np.nan)
+    for i in range(n):
+        if not np.isnan(bear_fvg_top[i]):
+            end = min(n, i + pullback_window + 1)
+            for j in range(i, end):
+                if np.isnan(bear_top_ff[j]):
+                    bear_top_ff[j] = bear_fvg_top[i]
+                    bear_bot_ff[j] = bear_fvg_bot[i]
+
+    # Price inside bearish FVG
+    in_bear_fvg = (close >= bear_bot_ff) & (close <= bear_top_ff)
+
+    # ------------------------------------------------------------------
+    # 5. Session windows — DST-aware conversion to Eastern Time
+    # ------------------------------------------------------------------
+    et_hour = _get_et_hours(idx, source_tz=source_tz)
+    in_killzone = np.isin(et_hour, list(_KILLZONE_HOURS_ET))
+
+    # ------------------------------------------------------------------
+    # 6. Raw setup flags (before one-per-session-per-day deduplication)
+    #    Long:  low swept, high NOT swept, in bullish FVG, in killzone
+    #    Short: high swept, low NOT swept, in bearish FVG, in killzone
+    # ------------------------------------------------------------------
+    raw_long = low_swept & ~high_swept & in_bull_fvg & in_killzone
+    raw_short = high_swept & ~low_swept & in_bear_fvg & in_killzone
+
+    # ------------------------------------------------------------------
+    # 7. Deduplicate to one entry per session per day + session cap
+    # ------------------------------------------------------------------
+    dates = np.array([t.date() for t in idx])
+    session_labels = np.array(
+        [_SESSION_NAMES.get(h, "") for h in et_hour], dtype=object
     )
 
-    # ------------------------------------------------------------------
-    # 3. Bullish Fair Value Gap (FVG)
-    #    On bar N: gap exists when candle[N-2].high < candle[N].low
-    #    (a two-bar imbalance to the upside).
-    # ------------------------------------------------------------------
-    df["bullish_fvg"] = high.shift(2) < low
+    def _collect_setups(raw_mask: np.ndarray, direction: str) -> list:
+        """
+        Walk through raw_mask chronologically, pick the first qualifying
+        bar per (date, session) group, apply session P&L cap.
 
-    # FVG price zone — only defined on bars where the gap forms
-    df["bullish_fvg_top"] = low.where(df["bullish_fvg"])
-    df["bullish_fvg_bottom"] = high.shift(2).where(df["bullish_fvg"])
+        For long:  SL below swept liquidity low - sl_buffer_pts
+        For short: SL above swept liquidity high + sl_buffer_pts
+        """
+        setups = []
+        seen: dict = {}  # (date, session) -> session_pnl_so_far
 
-    # Forward-fill the zone for pullback_window bars so price can
-    # re-enter the gap after it forms
-    df["bullish_fvg_top_ff"] = df["bullish_fvg_top"].ffill(limit=pullback_window)
-    df["bullish_fvg_bottom_ff"] = df["bullish_fvg_bottom"].ffill(limit=pullback_window)
-
-    # Price is "in the FVG" when close is between the two levels
-    df["in_bullish_fvg"] = (close <= df["bullish_fvg_top_ff"]) & (
-        close >= df["bullish_fvg_bottom_ff"]
-    )
-
-    # ------------------------------------------------------------------
-    # 4. Session windows — DST-aware conversion to Eastern Time
-    #
-    #    Data timestamps are in broker server time (Europe/Athens):
-    #      UTC+2 in winter (EET), UTC+3 in summer (EEST)
-    #    Target timezone: America/New_York (EST/EDT auto-handled by pytz)
-    #
-    #    Sessions (ET):
-    #      London       03:00 – 03:59
-    #      New York AM  10:00 – 10:59
-    #      New York PM  14:00 – 14:59
-    # ------------------------------------------------------------------
-    import pytz
-
-    server_tz = pytz.timezone("Europe/Athens")  # broker server: UTC+2/+3
-    eastern_tz = pytz.timezone("America/New_York")
-
-    # Localise the naive index as broker server time, then convert to ET
-    server_index = df.index.tz_localize(
-        server_tz, ambiguous="infer", nonexistent="shift_forward"
-    )
-    eastern_index = server_index.tz_convert(eastern_tz)
-    et_hour = eastern_index.hour
-
-    df["in_london"] = et_hour == 3
-    df["in_ny_am"] = et_hour == 10
-    df["in_ny_pm"] = et_hour == 14
-    df["in_session"] = df["in_london"] | df["in_ny_am"] | df["in_ny_pm"]
-
-    # Label each bar with its session name (empty string outside sessions)
-    df["session_label"] = ""
-    df.loc[df["in_london"], "session_label"] = "london"
-    df.loc[df["in_ny_am"], "session_label"] = "ny_am"
-    df.loc[df["in_ny_pm"], "session_label"] = "ny_pm"
-
-    # ------------------------------------------------------------------
-    # 5. Raw entry condition (all qualifying bars)
-    #    Bullish bias  : lows swept, highs NOT swept
-    #    FVG pullback  : close is inside the active bullish FVG zone
-    #    Session filter: inside any of the three session windows
-    # ------------------------------------------------------------------
-    df["buy_signal"] = (
-        df["low_swept"] & ~df["high_swept"] & df["in_bullish_fvg"] & df["in_session"]
-    )
-
-    # ------------------------------------------------------------------
-    # 6. One entry per SESSION per calendar day + session P&L cap
-    #
-    #    Process each (date, session) group chronologically.
-    #    Track a running estimated P&L for the session — when it drops
-    #    below session_cap_usd, no further entries are allowed that day.
-    #
-    #    P&L estimate per trade:
-    #      - SL hit   -> loss  = -sl_distance * lot_size
-    #      - TP hit   -> gain  =  sl_distance * rr_ratio * lot_size
-    #    We assume the trade resolves at SL or TP (50/50 prior) but only
-    #    use the SL loss for a conservative cap estimate — i.e. if the
-    #    previous trade in the session was a loser we count its full SL loss.
-    #    Winners don't offset the cap (conservative approach).
-    # ------------------------------------------------------------------
-    df["buy_signal_daily"] = False
-    df["sl_price"] = np.nan
-    df["tp_price"] = np.nan
-    df["_date"] = df.index.date
-
-    for (date, session), group in df.groupby(["_date", "session_label"]):
-        if session == "":
-            continue
-
-        session_pnl = 0.0  # running estimated loss for this session
-        prev_sl_dist = None  # SL distance (points) of last trade taken
-
-        day_session_mask = group["buy_signal"]
-
-        for bar_time, is_signal in day_session_mask.items():
-            if not is_signal:
+        for i in range(n):
+            if not raw_mask[i]:
+                continue
+            sess = session_labels[i]
+            if sess == "":
                 continue
 
-            # Apply session cap: if running loss already at/below cap, skip
-            if session_pnl <= session_cap_usd:
+            key = (dates[i], sess)
+            if key in seen:
+                continue  # already took an entry this session today
+
+            # Session cap check
+            sess_pnl_key = f"{dates[i]}_{sess}"
+            if not hasattr(_collect_setups, "_pnl"):
+                _collect_setups._pnl = {}  # type: ignore[attr-defined]
+            current_pnl = _collect_setups._pnl.get(sess_pnl_key, 0.0)  # type: ignore[attr-defined]
+            if current_pnl <= session_cap_usd:
+                seen[key] = True
                 continue
 
-            entry_price = close.loc[bar_time]
-            liq_low = df.loc[bar_time, "liquidity_low"]
+            entry_price = close[i]
 
-            sl_price = liq_low - sl_buffer_pts
-            sl_dist = entry_price - sl_price
+            if direction == "long":
+                sl = liq_low[i] - sl_buffer_pts
+                sl_dist = entry_price - sl
+            else:
+                sl = liq_high[i] + sl_buffer_pts
+                sl_dist = sl - entry_price
 
-            # Guard: skip if SL distance is zero or negative (malformed bar)
             if sl_dist <= 0:
                 continue
 
-            tp_price = entry_price + sl_dist * rr_ratio
+            tp = (
+                entry_price + rr_ratio * sl_dist
+                if direction == "long"
+                else entry_price - rr_ratio * sl_dist
+            )
 
-            df.loc[bar_time, "buy_signal_daily"] = True
-            df.loc[bar_time, "sl_price"] = sl_price
-            df.loc[bar_time, "tp_price"] = tp_price
-
-            # Estimate the P&L impact of this trade for the cap
-            # Conservatively assume a loss (SL hit) to be cautious
+            # Estimate session loss (conservative: assume SL hit)
             estimated_loss = -sl_dist * lot_size
-            session_pnl += estimated_loss
-            prev_sl_dist = sl_dist
+            _collect_setups._pnl[sess_pnl_key] = current_pnl + estimated_loss  # type: ignore[attr-defined]
 
-            # Only allow one entry per session per day
-            break
+            seen[key] = True
+            setups.append(
+                {
+                    "entry_ts": idx[i],
+                    "entry": float(entry_price),
+                    "sl": float(sl),
+                    "tp": float(tp),
+                    "direction": direction,
+                    "session": sess,
+                    "sl_dist": float(sl_dist),
+                    # FVG zone info (used by build_chart, ignored by backtest)
+                    "fvg_top": float(bull_top_ff[i])
+                    if direction == "long"
+                    else float(bear_top_ff[i]),
+                    "fvg_bottom": float(bull_bot_ff[i])
+                    if direction == "long"
+                    else float(bear_bot_ff[i]),
+                    "liq_level": float(liq_low[i])
+                    if direction == "long"
+                    else float(liq_high[i]),
+                }
+            )
 
-    df.drop(columns=["_date"], inplace=True)
+        # Reset the per-call state so it doesn't bleed between calls
+        if hasattr(_collect_setups, "_pnl"):
+            del _collect_setups._pnl  # type: ignore[attr-defined]
 
-    # ------------------------------------------------------------------
-    # 7. Compute SL/TP as fractions of entry price for vectorbt
-    #    sl_stop_frac = sl_distance / entry_price  (fraction below entry)
-    #    tp_stop_frac = tp_distance / entry_price  (fraction above entry)
-    # ------------------------------------------------------------------
-    entry_close = close.where(df["buy_signal_daily"])
-    sl_dist_col = entry_close - df["sl_price"]
-    tp_dist_col = df["tp_price"] - entry_close
+        return setups
 
-    df["sl_stop_frac"] = sl_dist_col / entry_close
-    df["tp_stop_frac"] = tp_dist_col / entry_close
+    buy_setups = _collect_setups(raw_long, "long")
+    sell_setups = _collect_setups(raw_short, "short")
 
-    # ------------------------------------------------------------------
-    # 8. Time-based fallback exit — 52 bars (minutes) after each entry
-    #    vectorbt will use SL/TP first; this only triggers if neither fires.
-    # ------------------------------------------------------------------
-    exit_bars = 52
-    df["sell_signal"] = False
+    # Package liquidity data for build_chart() — not used by backtest.py
+    liquidity = {
+        "liq_high": pd.Series(liq_high, index=idx),
+        "liq_low": pd.Series(liq_low, index=idx),
+        # True on bars where price actually touched/swept the level
+        "high_touched": pd.Series(high_touched, index=idx),
+        "low_touched": pd.Series(low_touched, index=idx),
+    }
 
-    for entry_time in df.index[df["buy_signal_daily"]]:
-        entry_pos = df.index.get_loc(entry_time)
-        exit_pos = min(entry_pos + exit_bars, len(df) - 1)
-        exit_time = df.index[exit_pos]
-        df.loc[exit_time, "sell_signal"] = True
-
-    return df
+    print(f"  Setups detected: {len(buy_setups)} long, {len(sell_setups)} short")
+    return sell_setups, buy_setups, liquidity
 
 
 # ---------------------------------------------------------------------------
-# Experiment Runner
+# Visualisation
 # ---------------------------------------------------------------------------
 
 
-def run_experiment(
-    symbol: str = "US30",
-    asset_type: str = "indices",
-    start_date: str = "2024-01-01",
-    end_date: str = "2024-12-31",
-    liquidity_window: int = 240,
-    sweep_lookback: int = 120,
-    pullback_window: int = 15,
-    show_chart: bool = True,
-    save_chart: bool = True,
-) -> tuple[pd.DataFrame, object]:
+def build_chart(
+    df: pd.DataFrame,
+    sell_setups: list,
+    buy_setups: list,
+    liquidity: dict | None = None,
+    symbol: str = SYMBOL,
+    timeframe: str = TIMEFRAME,
+    display_days: int = 5,
+    source_tz: str = "utc",
+) -> go.Figure:
     """
-    Run the Silver Bullet signal experiment and visualise results.
+    Build a Plotly candlestick chart with:
+      - Rolling liquidity high/low step lines (orange / teal)
+      - Diamond markers where price actually swept each level
+      - Bullish/bearish FVG zones (shaded rectangles)
+      - Entry markers (triangle-up/down) and time-exit markers (x)
+      - SL/TP dashed lines per trade
+      - Full legend
 
     Args:
-        symbol:            Trading symbol (default 'US30').
-        asset_type:        'fx' or 'indices' (default 'indices').
-        start_date:        Date range start (YYYY-MM-DD).
-        end_date:          Date range end (YYYY-MM-DD).
-        liquidity_window:  Rolling window for significant highs/lows.
-        sweep_lookback:    Lookback for sweep detection.
-        pullback_window:   Bars to keep FVG zone alive.
-        show_chart:        Open chart in browser.
-        save_chart:        Save chart HTML to reports/.
+        liquidity: Dict returned as third element of detect_setups():
+                     'liq_high'     : pd.Series — rolling N-bar high
+                     'liq_low'      : pd.Series — rolling N-bar low
+                     'high_touched' : pd.Series[bool] — bars where high was swept
+                     'low_touched'  : pd.Series[bool] — bars where low was swept
+                   Pass None (or omit) to skip liquidity overlays.
 
-    Returns:
-        (df, fig) tuple.
+    Returns a go.Figure.
     """
-    print(f"Loading {symbol} data ({start_date} to {end_date})...")
-    df = load_data(
-        symbol, asset_type=asset_type, start_date=start_date, end_date=end_date
-    )
-    print(f"  Loaded {len(df):,} rows  [{df.index.min()} -> {df.index.max()}]")
+    import vectorbt as vbt
 
-    print("Calculating Silver Bullet signals (London / NY AM / NY PM)...")
-    df = calculate_signals(
-        df,
-        liquidity_window=liquidity_window,
-        sweep_lookback=sweep_lookback,
-        pullback_window=pullback_window,
-    )
+    vbt.settings.plotting["use_widgets"] = False
 
-    n_entries = int(df["buy_signal_daily"].sum())
-    n_exits = int(df["sell_signal"].sum())
-    n_london = int((df["buy_signal_daily"] & df["in_london"]).sum())
-    n_ny_am = int((df["buy_signal_daily"] & df["in_ny_am"]).sum())
-    n_ny_pm = int((df["buy_signal_daily"] & df["in_ny_pm"]).sum())
-    print(
-        f"  Entry signals : {n_entries}  (London={n_london}, NY AM={n_ny_am}, NY PM={n_ny_pm})"
-    )
-    print(f"  Exit signals  : {n_exits}")
-
-    # Build a display-friendly sample — last 5 trading days so the chart
-    # is not too dense on 1-minute data for a long date range
-    print("Generating visualization (last 5 trading days of data)...")
+    # Limit display to last `display_days` trading days
     unique_dates = sorted(set(df.index.date))
-    if len(unique_dates) == 0:
-        raise ValueError(
-            f"No data found for {symbol} between {start_date} and {end_date}.\n"
-            "Check the date range — available data may differ."
-        )
-    display_cutoff = unique_dates[max(0, len(unique_dates) - 5)]
-    display_start = pd.Timestamp(display_cutoff)
-    df_display = df[df.index >= display_start]
+    cutoff = pd.Timestamp(unique_dates[max(0, len(unique_dates) - display_days)])
+    dv = df[df.index >= cutoff]
+    idx_list = dv.index.tolist()
 
-    fig = plot_candlestick_with_signals(
-        df_display,
-        title=f"{symbol} - ICT Silver Bullet  (liq={liquidity_window}, sweep={sweep_lookback}, pfbk={pullback_window})",
-        buy_signals=df_display["buy_signal_daily"],
-        sell_signals=df_display["sell_signal"],
-        indicators={
-            "Liquidity High": df_display["liquidity_high"],
-            "Liquidity Low": df_display["liquidity_low"],
-            "FVG Top": df_display["bullish_fvg_top_ff"],
-            "FVG Bottom": df_display["bullish_fvg_bottom_ff"],
-        },
-        show_volume=True,
+    TIME_EXIT_BARS = 52
+
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        row_heights=[0.85, 0.15],
+        vertical_spacing=0.03,
+        subplot_titles=[
+            f"{symbol} {timeframe} — ICT Silver Bullet (last {display_days} days)",
+            "Volume",
+        ],
     )
 
-    if save_chart:
-        reports_dir = project_root / "reports"
-        reports_dir.mkdir(exist_ok=True)
-        output_file = (
-            reports_dir / f"silver_bullet_{symbol}_{start_date}_{end_date}.html"
+    # -- Candlesticks --
+    fig.add_trace(
+        go.Candlestick(
+            x=idx_list,
+            open=dv["open"].tolist(),
+            high=dv["high"].tolist(),
+            low=dv["low"].tolist(),
+            close=dv["close"].tolist(),
+            name="Price",
+            increasing_line_color="#26a69a",
+            decreasing_line_color="#ef5350",
+            showlegend=False,
+        ),
+        row=1,
+        col=1,
+    )
+
+    # -- Liquidity levels --
+    if liquidity:
+        liq_high_v = liquidity["liq_high"].reindex(dv.index)
+        liq_low_v = liquidity["liq_low"].reindex(dv.index)
+
+        # Rolling liquidity high — orange step line
+        fig.add_trace(
+            go.Scatter(
+                x=idx_list,
+                y=liq_high_v.tolist(),
+                mode="lines",
+                line=dict(color="rgba(255,160,0,0.55)", width=1, shape="hv"),
+                name="Liq high",
+                legendgroup="liq_high",
+                hovertemplate="Liq high: %{y:.1f}<extra></extra>",
+            ),
+            row=1,
+            col=1,
         )
-        fig.write_html(str(output_file))
-        print(f"  Chart saved -> {output_file}")
 
-    if show_chart:
-        fig.show()
+        # Rolling liquidity low — teal step line
+        fig.add_trace(
+            go.Scatter(
+                x=idx_list,
+                y=liq_low_v.tolist(),
+                mode="lines",
+                line=dict(color="rgba(0,188,212,0.55)", width=1, shape="hv"),
+                name="Liq low",
+                legendgroup="liq_low",
+                hovertemplate="Liq low: %{y:.1f}<extra></extra>",
+            ),
+            row=1,
+            col=1,
+        )
 
-    return df, fig
+    # -- Killzone background shading --
+    # London 03, NY AM 10, NY PM 14 ET — semi-transparent yellow band spanning
+    # the full chart height. Uses xref="x" + yref="paper" so one shape covers
+    # both rows without needing row/col arguments.
+    et_hours_dv = _get_et_hours(dv.index, source_tz=source_tz)
+    in_kz = np.isin(et_hours_dv, list(_KILLZONE_HOURS_ET))
+
+    kz_legend_added = False
+    i = 0
+    while i < len(dv):
+        if in_kz[i]:
+            j = i
+            while j < len(dv) and in_kz[j]:
+                j += 1
+            x0 = dv.index[i]
+            x1 = dv.index[j - 1]
+            fig.add_shape(
+                type="rect",
+                xref="x",
+                yref="paper",
+                x0=x0,
+                x1=x1,
+                y0=0,
+                y1=1,
+                fillcolor="rgba(255,235,59,0.07)",
+                line=dict(width=0),
+                layer="below",
+            )
+            if not kz_legend_added:
+                fig.add_trace(
+                    go.Scatter(
+                        x=[None],
+                        y=[None],
+                        mode="markers",
+                        marker=dict(
+                            symbol="square", size=12, color="rgba(255,235,59,0.4)"
+                        ),
+                        name="Killzone window",
+                        legendgroup="killzone",
+                    ),
+                    row=1,
+                    col=1,
+                )
+                kz_legend_added = True
+            i = j
+        else:
+            i += 1
+
+    # -- Volume --
+    vol_colors = [
+        "#26a69a" if c >= o else "#ef5350" for c, o in zip(dv["close"], dv["open"])
+    ]
+    fig.add_trace(
+        go.Bar(
+            x=idx_list,
+            y=dv["volume"].tolist(),
+            name="Volume",
+            marker_color=vol_colors,
+            showlegend=False,
+        ),
+        row=2,
+        col=1,
+    )
+
+    # -- Legend dummy traces (shapes can't appear in legend) --
+    _DUMMY = dict(x=[None], y=[None], mode="markers")
+    fig.add_trace(
+        go.Scatter(
+            **_DUMMY,
+            marker=dict(
+                symbol="triangle-up",
+                size=12,
+                color="#26a69a",
+                line=dict(width=1, color="white"),
+            ),
+            name="Long entry",
+            legendgroup="long_entry",
+        ),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            **_DUMMY,
+            marker=dict(
+                symbol="triangle-down",
+                size=12,
+                color="#ef5350",
+                line=dict(width=1, color="white"),
+            ),
+            name="Short entry",
+            legendgroup="short_entry",
+        ),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            **_DUMMY,
+            marker=dict(symbol="x", size=10, color="white", line=dict(width=2)),
+            name="Time exit (52 bars)",
+            legendgroup="time_exit",
+        ),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=[None],
+            y=[None],
+            mode="lines",
+            line=dict(color="#26a69a", width=1, dash="dash"),
+            name="Take profit",
+            legendgroup="tp",
+        ),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=[None],
+            y=[None],
+            mode="lines",
+            line=dict(color="#ef5350", width=1, dash="dash"),
+            name="Stop loss",
+            legendgroup="sl",
+        ),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=[None],
+            y=[None],
+            mode="markers",
+            marker=dict(symbol="square", size=10, color="rgba(38,166,154,0.35)"),
+            name="Bull FVG zone",
+            legendgroup="bull_fvg",
+        ),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=[None],
+            y=[None],
+            mode="markers",
+            marker=dict(symbol="square", size=10, color="rgba(239,83,80,0.35)"),
+            name="Bear FVG zone",
+            legendgroup="bear_fvg",
+        ),
+        row=1,
+        col=1,
+    )
+
+    # -- Helper: resolve timestamp to display-window index position --
+    def _in_view(ts: pd.Timestamp) -> bool:
+        return dv.index[0] <= ts <= dv.index[-1]
+
+    def _time_exit_ts(entry_ts: pd.Timestamp) -> pd.Timestamp | None:
+        """Return the timestamp 52 bars after entry, or None if out of window."""
+        if entry_ts not in dv.index:
+            return None
+        pos = dv.index.get_loc(entry_ts)
+        exit_pos = min(pos + TIME_EXIT_BARS, len(dv) - 1)
+        return dv.index[exit_pos]
+
+    def _line_end(ts: pd.Timestamp, bars: int = 60) -> pd.Timestamp:
+        """Return timestamp `bars` ahead of ts, clamped to end of display window."""
+        if ts not in dv.index:
+            return dv.index[-1]
+        pos = dv.index.get_loc(ts)
+        return dv.index[min(pos + bars, len(dv) - 1)]
+
+    # -- Long setups --
+    long_exit_xs: list = []
+    long_exit_ys: list = []
+
+    for s in buy_setups:
+        ts = s["entry_ts"]
+        if not _in_view(ts):
+            continue
+        entry = s["entry"]
+        sl = s["sl"]
+        tp = s["tp"]
+        x1 = _line_end(ts, 60)
+
+        # FVG zone
+        fig.add_shape(
+            type="rect",
+            x0=ts,
+            x1=x1,
+            y0=s["fvg_bottom"],
+            y1=s["fvg_top"],
+            fillcolor="rgba(38,166,154,0.15)",
+            line=dict(color="rgba(38,166,154,0.5)", width=1),
+            row=1,
+            col=1,
+        )
+        # SL line
+        fig.add_shape(
+            type="line",
+            x0=ts,
+            x1=x1,
+            y0=sl,
+            y1=sl,
+            line=dict(color="#ef5350", width=1, dash="dash"),
+            row=1,
+            col=1,
+        )
+        # TP line
+        fig.add_shape(
+            type="line",
+            x0=ts,
+            x1=x1,
+            y0=tp,
+            y1=tp,
+            line=dict(color="#26a69a", width=1, dash="dash"),
+            row=1,
+            col=1,
+        )
+        # Entry marker
+        fig.add_trace(
+            go.Scatter(
+                x=[ts],
+                y=[entry],
+                mode="markers",
+                marker=dict(
+                    symbol="triangle-up",
+                    size=12,
+                    color="#26a69a",
+                    line=dict(width=1, color="white"),
+                ),
+                name="Long entry",
+                legendgroup="long_entry",
+                showlegend=False,
+                hovertemplate=f"Long entry<br>Price: {entry:.1f}<br>SL: {sl:.1f}<br>TP: {tp:.1f}<extra></extra>",
+            ),
+            row=1,
+            col=1,
+        )
+        # Time exit marker
+        exit_ts = _time_exit_ts(ts)
+        if exit_ts is not None:
+            exit_price = dv.loc[exit_ts, "close"]
+            long_exit_xs.append(exit_ts)
+            long_exit_ys.append(exit_price)
+
+    # Batch all long time-exit markers into one trace
+    if long_exit_xs:
+        fig.add_trace(
+            go.Scatter(
+                x=long_exit_xs,
+                y=long_exit_ys,
+                mode="markers",
+                marker=dict(symbol="x", size=10, color="white", line=dict(width=2)),
+                name="Time exit (52 bars)",
+                legendgroup="time_exit",
+                showlegend=False,
+                hovertemplate="Time exit<br>Price: %{y:.1f}<extra></extra>",
+            ),
+            row=1,
+            col=1,
+        )
+
+    # -- Short setups --
+    short_exit_xs: list = []
+    short_exit_ys: list = []
+
+    for s in sell_setups:
+        ts = s["entry_ts"]
+        if not _in_view(ts):
+            continue
+        entry = s["entry"]
+        sl = s["sl"]
+        tp = s["tp"]
+        x1 = _line_end(ts, 60)
+
+        # FVG zone
+        fig.add_shape(
+            type="rect",
+            x0=ts,
+            x1=x1,
+            y0=s["fvg_bottom"],
+            y1=s["fvg_top"],
+            fillcolor="rgba(239,83,80,0.15)",
+            line=dict(color="rgba(239,83,80,0.5)", width=1),
+            row=1,
+            col=1,
+        )
+        # SL line
+        fig.add_shape(
+            type="line",
+            x0=ts,
+            x1=x1,
+            y0=sl,
+            y1=sl,
+            line=dict(color="#ef5350", width=1, dash="dash"),
+            row=1,
+            col=1,
+        )
+        # TP line
+        fig.add_shape(
+            type="line",
+            x0=ts,
+            x1=x1,
+            y0=tp,
+            y1=tp,
+            line=dict(color="#26a69a", width=1, dash="dash"),
+            row=1,
+            col=1,
+        )
+        # Entry marker
+        fig.add_trace(
+            go.Scatter(
+                x=[ts],
+                y=[entry],
+                mode="markers",
+                marker=dict(
+                    symbol="triangle-down",
+                    size=12,
+                    color="#ef5350",
+                    line=dict(width=1, color="white"),
+                ),
+                name="Short entry",
+                legendgroup="short_entry",
+                showlegend=False,
+                hovertemplate=f"Short entry<br>Price: {entry:.1f}<br>SL: {sl:.1f}<br>TP: {tp:.1f}<extra></extra>",
+            ),
+            row=1,
+            col=1,
+        )
+        # Time exit marker
+        exit_ts = _time_exit_ts(ts)
+        if exit_ts is not None:
+            exit_price = dv.loc[exit_ts, "close"]
+            short_exit_xs.append(exit_ts)
+            short_exit_ys.append(exit_price)
+
+    if short_exit_xs:
+        fig.add_trace(
+            go.Scatter(
+                x=short_exit_xs,
+                y=short_exit_ys,
+                mode="markers",
+                marker=dict(symbol="x", size=10, color="white", line=dict(width=2)),
+                name="Time exit (52 bars)",
+                legendgroup="time_exit",
+                showlegend=False,
+                hovertemplate="Time exit<br>Price: %{y:.1f}<extra></extra>",
+            ),
+            row=1,
+            col=1,
+        )
+
+    # -- Layout --
+    fig.update_layout(
+        height=960,
+        template="plotly_dark",
+        xaxis_rangeslider_visible=False,
+        hovermode="x unified",
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="left",
+            x=0,
+            bgcolor="rgba(0,0,0,0.4)",
+            bordercolor="rgba(255,255,255,0.2)",
+            borderwidth=1,
+            font=dict(size=12),
+        ),
+        title=dict(
+            text=(
+                f"{symbol} — ICT Silver Bullet  |  "
+                f"LiqWin={LIQUIDITY_WINDOW}  Sweep={SWEEP_LOOKBACK}  "
+                f"PBwin={PULLBACK_WINDOW}  RR={RR_RATIO}"
+            ),
+            x=0.5,
+            xanchor="center",
+            font=dict(size=15),
+        ),
+    )
+    # Build rangebreaks from actual gaps in the data — only periods where
+    # data is genuinely absent (weekends, holidays) are collapsed.
+    # Finds every consecutive pair of bars whose gap > 1.5× the typical
+    # 1-minute interval, then emits one bounds=[gap_end, gap_start] per gap.
+    ts_arr = dv.index.sort_values().to_numpy()
+    deltas = np.diff(ts_arr).astype("timedelta64[ms]").astype(float)
+    # Only collapse gaps of 30 minutes or more — ignores tiny data dropouts
+    # while catching the weekend (~2 days) and the Dukascopy daily break (~1h46m)
+    thirty_min_ms = 30 * 60 * 1000
+    rangebreaks = []
+    for i in np.where(deltas >= thirty_min_ms)[0]:
+        gap_end = pd.Timestamp(ts_arr[i])
+        gap_start = pd.Timestamp(ts_arr[i + 1])
+        rangebreaks.append(dict(bounds=[gap_end.isoformat(), gap_start.isoformat()]))
+
+    # Simpler and more robust: build (end_of_data, start_of_next_data) pairs directly
+    rangebreaks = []
+    ts_arr = dv.index.sort_values().to_numpy()
+    deltas = np.diff(ts_arr).astype("timedelta64[ms]").astype(float)
+    normal_ms = float(pd.Series(deltas).mode().iloc[0])
+    for i in np.where(deltas > normal_ms * 1.5)[0]:
+        gap_end = pd.Timestamp(ts_arr[i])
+        gap_start = pd.Timestamp(ts_arr[i + 1])
+        rangebreaks.append(dict(bounds=[gap_end.isoformat(), gap_start.isoformat()]))
+
+    fig.update_xaxes(rangeslider_visible=False, rangebreaks=rangebreaks, row=1, col=1)
+    fig.update_xaxes(rangeslider_visible=False, rangebreaks=rangebreaks, row=2, col=1)
+
+    return fig
 
 
 # ---------------------------------------------------------------------------
@@ -410,11 +922,32 @@ def run_experiment(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    df, fig = run_experiment(
-        symbol="US30",
-        asset_type="indices",
-        start_date="2025-11-11",
-        end_date="2026-02-25",
-        show_chart=True,
-        save_chart=True,
+    print("=" * 70)
+    print("ICT SILVER BULLET — SIGNAL VISUALISATION")
+    print("=" * 70)
+
+    print(f"\nLoading {SYMBOL} data ({START_DATE} to {END_DATE})...")
+    df, source_tz = load_ohlcv(SYMBOL, START_DATE, END_DATE, TIMEFRAME)
+    print(
+        f"  {len(df):,} rows  [{df.index.min()} -> {df.index.max()}]  (source_tz={source_tz})"
     )
+
+    sell_setups, buy_setups, liquidity = detect_setups(df, source_tz=source_tz)
+    print(f"  Long setups  : {len(buy_setups)}")
+    print(f"  Short setups : {len(sell_setups)}")
+
+    fig = build_chart(
+        df,
+        sell_setups,
+        buy_setups,
+        liquidity=liquidity,
+        symbol=SYMBOL,
+        timeframe=TIMEFRAME,
+    )
+
+    reports_dir = Path(__file__).resolve().parent / "reports"
+    reports_dir.mkdir(exist_ok=True)
+    out = reports_dir / f"strategy_{SYMBOL}_{TIMEFRAME}.html"
+    fig.write_html(str(out))
+    print(f"\n  Chart saved -> {out}")
+    fig.show()

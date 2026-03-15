@@ -58,3 +58,6 @@ experiments/**/reports/
 .cache/
 *.bak
 *.tmp
+
+
+opencode.json
