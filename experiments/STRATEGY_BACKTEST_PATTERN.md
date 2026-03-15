@@ -300,7 +300,10 @@ RISK_PER_TRADE = 0.01     # 1% of account per trade
 PIP = 0.0001              # change to 0.01 for JPY pairs
 PIP_VALUE_PER_LOT = 10.0  # USD per pip per standard lot (adjust per symbol/account currency)
 STD_LOT = 100_000         # base units per standard lot
-FX_FEES = 0.00008         # fractional fee per side (~0.8 pip spread)
+
+# Fee model — see "Fee Modelling" section below for a full explanation
+FX_FEES = 0.0             # disabled in vectorbt — use fixed fee subtracted post-simulation
+FIXED_FEE_PER_TRADE = 8.0 # USD per round-trip (entry + exit); adjust per instrument
 ```
 
 ### setups_to_signal_arrays()
@@ -353,8 +356,8 @@ lot_units = lots * STD_LOT                        # base currency units (passed 
 ```python
 vbt.settings.plotting["use_widgets"] = False  # required before saving HTML
 
-combined_sl = long_sl.fillna(short_sl).fillna(0)
-combined_tp = long_tp.fillna(short_tp).fillna(0)
+combined_sl = long_sl.fillna(short_sl)  # do NOT fillna(0) — see Common Pitfalls
+combined_tp = long_tp.fillna(short_tp)
 
 pf = vbt.Portfolio.from_signals(
     close=df["close"],
@@ -365,10 +368,10 @@ pf = vbt.Portfolio.from_signals(
     sl_stop=combined_sl,
     tp_stop=combined_tp,
     stop_exit_price="StopMarket",   # fills at the exact SL/TP price, not bar close
-    init_cash=ACCOUNT_SIZE * LEVERAGE,
+    init_cash=ACCOUNT_SIZE,         # real margin capital only — NOT * LEVERAGE
     size=lot_units,
     size_type="amount",
-    fees=FX_FEES,
+    fees=FX_FEES,                   # 0.0 — fees subtracted manually post-simulation
     freq=TIMEFRAME,
     accumulate=False,
 )
@@ -376,21 +379,25 @@ pf = vbt.Portfolio.from_signals(
 
 Key decisions:
 - **`stop_exit_price="StopMarket"`** — exits at the exact stop level, not the bar close. If price gaps through the level, fills at next bar open. This is the realistic behaviour. The default `"Close"` would overstate losses.
-- **`init_cash=ACCOUNT_SIZE * LEVERAGE`** — vectorbt simulates on notional buying power. P&L is re-anchored to real margin capital after the run.
+- **`init_cash=ACCOUNT_SIZE`** — pass real margin capital only. Do **not** multiply by `LEVERAGE`. See "Fee Modelling" section for why.
 - **`exits=False` / `short_exits=False`** — positions are never manually exited. The only exits are SL and TP stops.
 - **`accumulate=False`** — no pyramiding. Only one position per direction at a time.
-- **Combined SL/TP arrays** — `long_sl.fillna(short_sl)` merges both directions into a single array. On bars with no signal both are 0, which vectorbt ignores.
+- **Combined SL/TP arrays** — `long_sl.fillna(short_sl)` merges both directions into a single array. NaN on non-signal bars is correct — do not fill with 0 (see Common Pitfalls).
 
-### P&L Re-anchoring
-
-vectorbt tracks equity starting from `init_cash = ACCOUNT_SIZE * LEVERAGE`. To convert back to real capital terms:
+### P&L Re-anchoring and Fee Subtraction
 
 ```python
-abs_pnl = pf.value().iloc[-1] - (ACCOUNT_SIZE * LEVERAGE)
+stats = pf.stats()
+total_trades = int(stats.get("Total Trades", 0))
+
+gross_pnl  = pf.value().iloc[-1] - ACCOUNT_SIZE        # vectorbt gross result
+total_fees = total_trades * FIXED_FEE_PER_TRADE         # fixed cost per round-trip
+abs_pnl    = gross_pnl - total_fees                     # net P&L after fees
+
 return_on_margin = (abs_pnl / ACCOUNT_SIZE) * 100
 ```
 
-This is the correct way to express return — as a percentage of the actual capital at risk (margin), not the inflated notional.
+With `init_cash=ACCOUNT_SIZE`, the base is already in real capital terms — no leverage offset required.
 
 ### Metrics Extracted
 
@@ -440,6 +447,74 @@ The MLflow server uses `--serve-artifacts` with proxy mode. Artifacts are upload
 
 ---
 
+## Fee Modelling
+
+### The Problem with Percentage Fees
+
+vectorbt's `fees` parameter takes a **fraction of notional trade value** (e.g. `0.00008` = 0.008% per side). This sounds small but compounds badly with large lot sizes:
+
+```
+Example: 0.5 standard lots on EURUSD at 1.1000
+Notional = 0.5 × 100,000 × 1.1000 = $55,000
+Fee at 0.008% = $55,000 × 0.00008 = $4.40 per side = $8.80 round-trip
+```
+
+That is reasonable in this case, but the fee **scales with the lot size**. With risk-based sizing, the lot size varies per trade (larger lots when SL is tight, smaller when SL is wide). This means:
+
+- Trades with tight SLs get oversized lots → disproportionately large fees → SL is not the actual worst case
+- The percentage fee model rewards wide SLs (which are already less efficient)
+- It introduces an artificial bias that does not reflect how retail brokers charge
+
+Retail FX brokers charge **spread**, not a percentage. Spread cost per trade is approximately constant in dollar terms (it depends on pip size and current price, not the notional value of your position).
+
+### The Correct Model: Fixed Fee Per Round-Trip
+
+Subtract a fixed dollar amount per completed trade post-simulation:
+
+```python
+FX_FEES = 0.0                  # disabled in vectorbt
+FIXED_FEE_PER_TRADE = 8.0      # USD per round-trip — set this per instrument
+
+# After vbt.Portfolio.from_signals():
+stats = pf.stats()
+total_trades = int(stats.get("Total Trades", 0))
+gross_pnl    = pf.value().iloc[-1] - ACCOUNT_SIZE
+total_fees   = total_trades * FIXED_FEE_PER_TRADE
+abs_pnl      = gross_pnl - total_fees
+```
+
+### Calibrating FIXED_FEE_PER_TRADE
+
+Use the typical spread for the instrument and the average lot size from a test run:
+
+```
+fee_per_trade ≈ spread_pips × pip_value_per_lot × avg_lots × 2  (×2 for entry + exit)
+```
+
+| Instrument | Typical spread | Pip value (1 lot) | Conservative estimate |
+|---|---|---|---|
+| EURUSD | 0.5–1.0 pip | $10 | $8–$10 |
+| USDJPY | 0.5–1.0 pip | $9.50 | $8–$10 |
+| GBPUSD | 0.8–1.5 pip | $10 | $10–$15 |
+| XAUUSD | 2–4 pip ($0.01) | $1 | $5–$10 |
+| US30 | 2–5 points | $1 | $5–$10 |
+
+Round up to be conservative. The goal is a realistic worst-case, not an optimistic best-case.
+
+### Why Not `init_cash = ACCOUNT_SIZE * LEVERAGE`
+
+A common mistake is passing `init_cash=ACCOUNT_SIZE * LEVERAGE` to give vectorbt "notional buying power". This inflates the starting cash 100× and causes all PnL figures to be 100× too large. The `size` parameter (in base currency units) already controls position size correctly — `init_cash` only needs to be large enough that vectorbt does not reject orders for insufficient cash. `ACCOUNT_SIZE` alone is sufficient because the lot sizes are computed from risk %, not from available cash.
+
+```python
+# WRONG — inflates all PnL by 100x
+init_cash=ACCOUNT_SIZE * LEVERAGE   # $1,000,000
+
+# CORRECT
+init_cash=ACCOUNT_SIZE              # $10,000
+```
+
+---
+
 ## Data Contract Between the Two Scripts
 
 `backtest.py` depends on exactly these things from `strategy.py`:
@@ -475,12 +550,16 @@ The additional keys in the setup dict (`ob_ts`, `fvg_ts`, etc.) are used only by
 
 ## Common Pitfalls
 
-| Pitfall | Fix |
-|---|---|
-| SL on wrong side of entry | `backtest.py` silently drops the setup. Add `assert sl > entry` (SELL) or `assert sl < entry` (BUY) in `detect_setups()` to catch this during development |
-| Entry fires on an FVG-forming candle | Use `entry_start = max(mit_bar + 1, fvg_bar + 2)` — never `fvg_bar` or `fvg_bar + 1` |
-| Lookahead bias in signal calculation | Use `.shift(1)` when comparing current vs previous bar values. Never use future data to compute the entry bar's signal |
-| `stop_exit_price` defaulting to `"Close"` | Always pass `stop_exit_price="StopMarket"` explicitly. The default fills at bar close, overstating losses |
-| `use_widgets=True` crashes HTML save | Set `vbt.settings.plotting["use_widgets"] = False` before any `.plot()` or `.write_html()` call |
-| MLflow artifacts not uploading | Set `os.environ["MLFLOW_ENABLE_PROXY_MLFLOW_ARTIFACTS"] = "true"` before any `import mlflow` takes effect |
-| Timezone mismatch with smc library | Strip timezone from the DataFrame index: `df.index = df.index.tz_localize(None)` |
+| Pitfall | Symptom | Fix |
+|---|---|---|
+| `init_cash=ACCOUNT_SIZE * LEVERAGE` | All PnL figures are 100× too large (e.g. +1,163% instead of +11.6%) | Use `init_cash=ACCOUNT_SIZE` only. Position size is already controlled by the `size` array |
+| `fees=FX_FEES` with a percentage fee | Fee per trade scales with lot size, distorting results for risk-based sizing | Set `FX_FEES=0.0` and subtract `FIXED_FEE_PER_TRADE * total_trades` from gross PnL manually |
+| `gross_pnl` base wrong after removing leverage | PnL still references the old `ACCOUNT_SIZE * LEVERAGE` offset | Use `gross_pnl = pf.value().iloc[-1] - ACCOUNT_SIZE` (no leverage multiplier) |
+| `combined_sl.fillna(0)` on non-signal bars | Phantom stop-outs fire on every non-entry bar, collapsing the equity curve | Leave NaN on non-signal bars: `combined_sl = long_sl.fillna(short_sl)` — do not chain `.fillna(0)` |
+| SL on wrong side of entry | Setup silently dropped with no error | Add `assert sl > entry` (SELL) or `assert sl < entry` (BUY) in `detect_setups()` during development |
+| Entry fires on an FVG-forming candle | Lookahead bias — strategy cannot have known the FVG existed | Use `entry_start = max(mit_bar + 1, fvg_bar + 2)` — never `fvg_bar` or `fvg_bar + 1` |
+| Lookahead bias in signal calculation | Unrealistically high win rate | Use `.shift(1)` when comparing current vs previous bar values |
+| `stop_exit_price` defaulting to `"Close"` | SL/TP fill at bar close instead of stop level, overstating losses | Always pass `stop_exit_price="StopMarket"` explicitly |
+| `use_widgets=True` crashes HTML save | `write_html()` raises an error or produces a blank file | Set `vbt.settings.plotting["use_widgets"] = False` before any `.plot()` or `.write_html()` call |
+| MLflow artifacts not uploading | Silent failure or HTTP error during `log_artifacts` | Set `os.environ["MLFLOW_ENABLE_PROXY_MLFLOW_ARTIFACTS"] = "true"` before any `import mlflow` |
+| Timezone mismatch with smc library | Errors or misaligned signals | Strip timezone from the DataFrame index: `df.index = df.index.tz_localize(None)` |
