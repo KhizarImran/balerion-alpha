@@ -377,6 +377,45 @@ def run_backtest() -> None:
     reports_dir = Path(__file__).resolve().parent / "reports" / f"{SYMBOL}_{run_ts}"
     reports_dir.mkdir(parents=True, exist_ok=True)
 
+    # Config snapshot
+    config_txt = reports_dir / "config.txt"
+    with open(config_txt, "w", encoding="utf-8") as f:
+        f.write("TrendBO — Config Snapshot\n")
+        f.write("=" * 60 + "\n\n")
+        f.write("# --- Data ---\n")
+        f.write(f"SYMBOL                  = {SYMBOL!r}\n")
+        f.write(f"START_DATE              = {START_DATE!r}\n")
+        f.write(f"END_DATE                = {END_DATE!r}\n")
+        f.write(f"TIMEFRAME               = {TIMEFRAME!r}\n")
+        f.write("\n# --- Strategy parameters ---\n")
+        f.write(f"RISK_REWARD             = {RISK_REWARD}\n")
+        f.write(f"EMA_FAST                = {EMA_FAST}\n")
+        f.write(f"EMA_SLOW                = {EMA_SLOW}\n")
+        f.write(f"ADX_THRESHOLD           = {ADX_THRESHOLD}\n")
+        f.write(f"RANGE_ATR_MULT          = {RANGE_ATR_MULT}\n")
+        f.write(f"CONSOL_MIN_BARS         = {CONSOL_MIN_BARS}\n")
+        f.write(f"MIN_CONSOLIDATION_PIPS  = {MIN_CONSOLIDATION_PIPS}\n")
+        f.write(f"MIN_SL_PIPS             = {MIN_SL_PIPS}\n")
+        f.write(f"SESSION_START_HOUR      = {SESSION_START_HOUR}\n")
+        f.write(f"SESSION_END_HOUR        = {SESSION_END_HOUR}\n")
+        f.write("\n# --- Account & sizing ---\n")
+        f.write(f"ACCOUNT_SIZE            = {ACCOUNT_SIZE}\n")
+        f.write(f"LEVERAGE                = {LEVERAGE}\n")
+        f.write(f"RISK_PER_TRADE          = {RISK_PER_TRADE}\n")
+        f.write(
+            f"FIXED_FEE_PER_TRADE     = {FIXED_FEE_PER_TRADE}  # USD per round-trip\n"
+        )
+        f.write("\n# --- Instrument ---\n")
+        f.write(f"PIP                     = {PIP}\n")
+        f.write(f"PIP_VALUE_PER_LOT       = {PIP_VALUE_PER_LOT}\n")
+        f.write(f"STD_LOT                 = {STD_LOT}\n")
+        f.write(f"_IS_JPY_PAIR            = {_IS_JPY_PAIR}\n")
+        f.write("\n# --- vectorbt ---\n")
+        f.write(f"fees in vbt             = 0.0  (post-sim deduction used instead)\n")
+        f.write("\n# --- MLflow ---\n")
+        f.write(f"MLFLOW_TRACKING_URI     = {MLFLOW_TRACKING_URI!r}\n")
+        f.write(f"MLFLOW_EXPERIMENT       = {MLFLOW_EXPERIMENT!r}\n")
+
     # Text report
     report_txt = reports_dir / "backtest_report.txt"
     with open(report_txt, "w", encoding="utf-8") as f:

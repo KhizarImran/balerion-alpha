@@ -269,6 +269,34 @@ def run_backtest():
     reports_dir = Path(__file__).resolve().parent / "reports" / f"{SYMBOL}_{run_ts}"
     reports_dir.mkdir(parents=True, exist_ok=True)
 
+    # Config snapshot
+    config_txt = reports_dir / "config.txt"
+    with open(config_txt, "w", encoding="utf-8") as f:
+        f.write("Unicorn-ICT (Failed OB + FVG) — Config Snapshot\n")
+        f.write("=" * 60 + "\n\n")
+        f.write("# --- Data ---\n")
+        f.write(f"SYMBOL              = {SYMBOL!r}\n")
+        f.write(f"START_DATE          = {START_DATE!r}\n")
+        f.write(f"END_DATE            = {END_DATE!r}\n")
+        f.write(f"TIMEFRAME           = {TIMEFRAME!r}\n")
+        f.write("\n# --- Strategy parameters ---\n")
+        f.write(f"SWING_LENGTH        = {SWING_LENGTH}\n")
+        f.write(f"RISK_REWARD         = {RISK_REWARD}\n")
+        f.write("\n# --- Account & sizing ---\n")
+        f.write(f"ACCOUNT_SIZE        = {ACCOUNT_SIZE}\n")
+        f.write(f"LEVERAGE            = {LEVERAGE}\n")
+        f.write(f"RISK_PER_TRADE      = {RISK_PER_TRADE}\n")
+        f.write(f"FIXED_FEE_PER_TRADE = {FIXED_FEE_PER_TRADE}  # USD per round-trip\n")
+        f.write("\n# --- Instrument ---\n")
+        f.write(f"PIP                 = {PIP}\n")
+        f.write(f"PIP_VALUE_PER_LOT   = {PIP_VALUE_PER_LOT}\n")
+        f.write(f"STD_LOT             = {STD_LOT}\n")
+        f.write("\n# --- vectorbt ---\n")
+        f.write(f"fees in vbt         = 0.0  (post-sim deduction used instead)\n")
+        f.write("\n# --- MLflow ---\n")
+        f.write(f"MLFLOW_TRACKING_URI = {MLFLOW_TRACKING_URI!r}\n")
+        f.write(f"MLFLOW_EXPERIMENT   = 'unicorn-ict'\n")
+
     # text report
     report_path = reports_dir / "backtest_report.txt"
     with open(report_path, "w", encoding="utf-8") as f:
