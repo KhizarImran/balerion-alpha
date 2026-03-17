@@ -1,9 +1,12 @@
 """
 TrendBO — Live Execution Bot
 
-Connects to MetaTrader 5, fetches USDJPY 1-hour bars on every candle close,
-runs the TrendBO strategy logic, and executes trades automatically via the
-MT5 Python API.
+Connects to MetaTrader 5, fetches 1-hour bars for the specified symbol on
+every candle close, runs the TrendBO strategy logic, and executes trades
+automatically via the MT5 Python API.
+
+Pass the symbol via the --symbol argument at runtime (see USAGE below).
+One process per symbol — run multiple instances for multiple pairs.
 
 =============================================================================
 SETUP — copy .env.example to .env and fill in your values
@@ -39,12 +42,12 @@ MT5 SETUP
 - "Allow automated trading" must be enabled:
       MT5 -> Tools -> Options -> Expert Advisors -> Allow automated trading
 - Your account must be logged in before running this script
-- USDJPY must be visible in Market Watch
+- The symbol must be visible in Market Watch
 
 =============================================================================
 STRATEGY SUMMARY
 =============================================================================
-Asset:     USDJPY, 1-hour bars
+Asset:     Any FX pair supported by the broker, 1-hour bars
 Sessions:  UTC 07:00 - 20:00 (London open to NY close)
            No trades outside this window.
 
@@ -65,22 +68,25 @@ Stop Loss:   Long  — rolling low at breakout bar
 Take Profit: RISK_REWARD * SL distance
 Sizing:      Risk-based — 1% of ACCOUNT_SIZE per trade
              lots = (ACCOUNT_SIZE * RISK_PER_TRADE) / (sl_pips * pip_value_per_lot)
-             pip_value_per_lot computed from live USDJPY rate at startup
+             pip_value_per_lot computed from live symbol rate at startup
+
+Magic:       MAGIC = 4444 for all TrendBO instances regardless of symbol.
+             Isolation between symbols is achieved by positions_get(symbol=SYMBOL).
 
 No time-based exit — SL/TP handles all exits.
 
 =============================================================================
-COEXISTENCE WITH RangeBO
-=============================================================================
-Both TrendBO and RangeBO can trade USDJPY simultaneously. They are separated
-by magic number (TrendBO = 20261002, RangeBO = its own magic). Each bot only
-manages positions it placed itself.
-
-=============================================================================
 USAGE
 =============================================================================
-    uv run python experiments/TrendBO/live.py
+    # Single pair:
+    uv run python experiments/TrendBO/live.py --symbol USDJPY
 
+    # Multiple pairs — one process each:
+    uv run python experiments/TrendBO/live.py --symbol USDJPY
+    uv run python experiments/TrendBO/live.py --symbol EURUSD
+    uv run python experiments/TrendBO/live.py --symbol GBPUSD
+
+Each process writes its own log file: live_USDJPY.log, live_EURUSD.log, etc.
 The script runs forever. Press Ctrl+C to stop.
 It wakes up every ~3600 seconds (after each 1-hour candle close), checks
 for signals, and sleeps again until the next hour. Telegram alerts are
@@ -92,6 +98,7 @@ import sys
 import io
 import time
 import logging
+import argparse
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -110,21 +117,38 @@ from dotenv import load_dotenv
 
 
 # ---------------------------------------------------------------------------
-# Config
+# Symbol — parsed from --symbol command-line argument
 # ---------------------------------------------------------------------------
 
-SYMBOL = "USDJPY"
+_parser = argparse.ArgumentParser(description="TrendBO Live Bot")
+_parser.add_argument(
+    "--symbol",
+    required=True,
+    help="MT5 symbol to trade, e.g. USDJPY, EURUSD, GBPUSD",
+)
+_args = _parser.parse_args()
+
+SYMBOL = _args.symbol.upper()
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 
 # MT5 terminal path — set to the terminal64.exe of the specific installation
 # you want this strategy to use. None = auto-detect (only works if you have
 # exactly one MT5 installed).
 MT5_PATH = r"C:\Program Files\MetaTrader 5\terminal64.exe"
 
-# Magic number — uniquely identifies trades placed by this bot.
-# RangeBO uses a different magic number so both can trade USDJPY independently.
+# Magic number — same for all TrendBO instances regardless of symbol.
+# Each process is isolated by symbol via positions_get(symbol=SYMBOL).
 MAGIC = 4444
 
 _UTC_TZ = timezone.utc
+
+# Pip size — derived from symbol (JPY pairs use 0.01, all others 0.0001)
+_JPY_PAIRS = {"USDJPY", "EURJPY", "GBPJPY", "AUDJPY", "CADJPY", "CHFJPY", "NZDJPY"}
+PIP = 0.01 if SYMBOL in _JPY_PAIRS else 0.0001
 
 # Strategy parameters — match backtest.py values exactly
 EMA_FAST = 50
@@ -147,14 +171,12 @@ ACCOUNT_SIZE = 10_000  # real margin capital (USD)
 LEVERAGE = 100  # 1:100
 RISK_PER_TRADE = 0.01  # 1% of account per trade
 
-# USDJPY instrument constants
-PIP = 0.01  # pip size for JPY pairs
+# Instrument constants
 STD_LOT = 100_000  # units per standard lot
 
 # _pip_value_per_lot is NOT hardcoded here — it is computed from the live
-# USDJPY rate once at startup and stored as a module-level variable.
-# Formula: 1 pip (0.01 JPY) * 100,000 units / USDJPY_rate = USD per pip per lot
-# e.g. at USDJPY=150: 1_000 / 150 = $6.67 per pip per lot
+# symbol rate once at startup via _compute_pip_value() and stored as a
+# module-level variable. See connect_mt5().
 
 # How many 1-hour bars to fetch on each tick
 BARS_TO_FETCH = 500  # must exceed EMA_SLOW (200) + ADX_PERIOD + RANGE_PERIOD warmup
@@ -167,8 +189,12 @@ WAKEUP_EARLY_SECS = 5
 # Module-level state
 # ---------------------------------------------------------------------------
 
-# Computed from live USDJPY rate in connect_mt5() — used by _compute_lot_units()
+# Computed from live symbol rate in connect_mt5() — used by _compute_lot_units()
 _pip_value_per_lot: float = 0.0
+
+# Number of decimal places for this symbol's prices — set from mt5.symbol_info().digits
+# in connect_mt5(). Used for SL/TP rounding and log formatting.
+_price_digits: int = 5
 
 # Deduplication: stores the timestamp of the last bar we entered on.
 # Prevents re-firing the same consolidation breakout signal on every hourly tick
@@ -430,6 +456,24 @@ def _compute_lot_units(sl_pips: float) -> float:
     return lots
 
 
+def _compute_pip_value(symbol: str, rate: float) -> float:
+    """
+    Compute USD pip value per standard lot for the given symbol and live rate.
+
+    USD-quoted pairs (EURUSD, GBPUSD, AUDUSD, NZDUSD):
+        pip_value = PIP * STD_LOT  — $10.00 flat, quote currency is already USD.
+
+    All other pairs (JPY-quoted, CAD-quoted, etc.):
+        pip_value = (PIP * STD_LOT) / rate
+        For JPY pairs this is exact (e.g. USDJPY=150 -> $6.67/pip/lot).
+        For other non-USD-quoted pairs it is an acceptable approximation.
+    """
+    _USD_QUOTED = {"EURUSD", "GBPUSD", "AUDUSD", "NZDUSD"}
+    if symbol in _USD_QUOTED:
+        return PIP * STD_LOT
+    return (PIP * STD_LOT) / rate
+
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -441,7 +485,7 @@ logging.basicConfig(
     handlers=[
         logging.StreamHandler(sys.stdout),
         logging.FileHandler(
-            Path(__file__).resolve().parent / "live.log",
+            Path(__file__).resolve().parent / f"live_{SYMBOL}.log",
             encoding="utf-8",
         ),
     ],
@@ -507,11 +551,12 @@ def send_telegram(message: str) -> None:
 
 def connect_mt5() -> bool:
     """
-    Initialise and log into MT5. On success, fetches the live USDJPY rate
-    and sets the module-level _pip_value_per_lot.
+    Initialise and log into MT5. On success:
+      - fetches symbol_info to set _price_digits
+      - fetches the live rate to compute _pip_value_per_lot via _compute_pip_value()
     Returns True on success.
     """
-    global _pip_value_per_lot
+    global _pip_value_per_lot, _price_digits
 
     init_kwargs: dict = {}
     if MT5_PATH is not None:
@@ -537,27 +582,35 @@ def connect_mt5() -> bool:
         mt5.shutdown()
         return False
 
+    # Fetch symbol metadata — digits used for SL/TP rounding and log formatting
+    sym_info = mt5.symbol_info(SYMBOL)
+    if sym_info is None:
+        log.error(f"symbol_info({SYMBOL}) failed: {mt5.last_error()}")
+        mt5.shutdown()
+        return False
+    _price_digits = sym_info.digits
+
     # Brief pause so the terminal is ready to serve data
     time.sleep(2)
 
-    # Compute pip value per lot from live USDJPY rate
-    # Formula: 1 pip (0.01 JPY) * 100,000 units / USDJPY_rate = USD per pip per lot
+    # Compute pip value per lot from live symbol rate
     tick = mt5.symbol_info_tick(SYMBOL)
     if tick is None:
         log.error(f"Cannot get tick for {SYMBOL} after login: {mt5.last_error()}")
         mt5.shutdown()
         return False
 
-    usdjpy_rate = tick.ask
-    _pip_value_per_lot = (PIP * STD_LOT) / usdjpy_rate
+    live_rate = tick.ask
+    _pip_value_per_lot = _compute_pip_value(SYMBOL, live_rate)
     log.info(
         f"MT5 connected | Account: {info.login} | "
         f"Balance: ${info.balance:,.2f} | "
         f"Server: {info.server}"
     )
     log.info(
-        f"USDJPY rate at startup: {usdjpy_rate:.3f} | "
-        f"Pip value per lot: ${_pip_value_per_lot:.4f}"
+        f"{SYMBOL} rate at startup: {live_rate:.{_price_digits}f} | "
+        f"Pip value per lot: ${_pip_value_per_lot:.4f} | "
+        f"Price digits: {_price_digits}"
     )
     return True
 
@@ -669,9 +722,9 @@ def open_position(
         "volume": float(lots),
         "type": order_type,
         "price": price,
-        "sl": round(sl_price, 3),
-        "tp": round(tp_price, 3),
-        "deviation": 20,  # FX standard — USDJPY is liquid
+        "sl": round(sl_price, _price_digits),
+        "tp": round(tp_price, _price_digits),
+        "deviation": 20,  # FX standard
         "magic": MAGIC,
         "comment": "TrendBO",
         "type_time": mt5.ORDER_TIME_GTC,
@@ -687,7 +740,8 @@ def open_position(
 
     log.info(
         f"Order executed | {direction.upper()} {lots} lots {SYMBOL} "
-        f"@ {result.price:.3f} | SL {sl_price:.3f} | TP {tp_price:.3f} | "
+        f"@ {result.price:.{_price_digits}f} | "
+        f"SL {sl_price:.{_price_digits}f} | TP {tp_price:.{_price_digits}f} | "
         f"ticket #{result.order}"
     )
     return result
@@ -736,7 +790,7 @@ def close_position(position: "mt5.TradePosition") -> tuple:
 
     log.info(
         f"Position closed | ticket #{position.ticket} | "
-        f"close @ {result.price:.3f} | P&L: {pnl_pips:+.1f} pips"
+        f"close @ {result.price:.{_price_digits}f} | P&L: {pnl_pips:+.1f} pips"
     )
     return True, pnl_pips
 
