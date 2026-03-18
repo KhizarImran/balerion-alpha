@@ -9,7 +9,7 @@ Bollinger Bands mean reversion strategy on EURGBP 1H:
   - No time exit — SL/TP handles all exits
   - One trade at a time (detect_setups deduplicates via forward simulation)
 
-Risk management:
+Risk management :
   - 1% of account risked per trade
   - Lot size computed from SL distance so each SL hit = exactly 1% loss
   - Fees: fixed $5 per round-trip (conservative EURGBP retail spread estimate)
